@@ -1293,8 +1293,11 @@ def main() -> None:
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
     else:
+        # Use uncompiled base_model for eval when seq_len differs from training
+        # to avoid torch.compile recompilation limit on shape changes
+        eval_model = base_model if args.eval_seq_len != args.train_seq_len else model
         q_val_loss, q_val_bpb = eval_val(
-            args, model, rank, world_size, device, grad_accum_steps,
+            args, eval_model, rank, world_size, device, grad_accum_steps,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             seq_len=args.eval_seq_len,
         )
