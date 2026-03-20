@@ -299,13 +299,16 @@ def eval_val(
 def eval_val_ttt(
     args: Hyperparameters,
     base_model: nn.Module,
+    rank: int,
+    world_size: int,
     device: torch.device,
     val_tokens: Tensor,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    """Test-time training: adapt on val data chunk-by-chunk, scoring as we go."""
+    """Test-time training: adapt on val data chunk-by-chunk, scoring as we go.
+    Each rank independently adapts on its shard, then results are all-reduced."""
     seq_len = args.eval_seq_len
     # Select TTT params: embeddings + per-position control scalars
     ttt_params = []
@@ -317,12 +320,14 @@ def eval_val_ttt(
             p.requires_grad_(False)
     ttt_opt = torch.optim.Adam(ttt_params, lr=args.ttt_lr)
     total_seqs = (val_tokens.numel() - 1) // seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     base_model.train()
-    for seq_idx in range(total_seqs):
+    for seq_idx in range(seq_start, seq_end):
         start = seq_idx * seq_len
         chunk = val_tokens[start : start + seq_len + 1].to(device=device, dtype=torch.int64)
         x = chunk[:-1].unsqueeze(0)
@@ -341,6 +346,11 @@ def eval_val_ttt(
         loss.backward()
         ttt_opt.step()
         ttt_opt.zero_grad()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
 
     for p in base_model.parameters():
         p.requires_grad_(True)
@@ -1256,6 +1266,13 @@ def main() -> None:
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
 
+    # Clear QAT bits — we are evaluating the exported artifact, not training.
+    # Without this, eval_val_ttt (which sets model.train()) would fake-quantize
+    # the already-dequantized weights, double-quantizing and corrupting scores.
+    for m in base_model.modules():
+        if isinstance(m, CastedLinear):
+            m._qat_bits = 0
+
     # NTK-aware RoPE scaling for longer eval context
     if args.eval_seq_len > args.train_seq_len:
         rope_scale = args.eval_rope_scale if args.eval_rope_scale > 0 else (args.eval_seq_len / args.train_seq_len)
@@ -1272,7 +1289,7 @@ def main() -> None:
     if args.ttt_enabled:
         log0("Running test-time training eval...")
         q_val_loss, q_val_bpb = eval_val_ttt(
-            args, base_model, device, val_tokens,
+            args, base_model, rank, world_size, device, val_tokens,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
     else:

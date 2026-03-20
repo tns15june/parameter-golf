@@ -48,7 +48,7 @@ else
 fi
 cd parameter-golf
 
-pip install -q -r requirements.txt 2>&1 | tail -3
+pip install -q -r requirements.txt
 echo "Dependencies installed."
 
 # ----- STEP 2: Download FULL dataset -----
