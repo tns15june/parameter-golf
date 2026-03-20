@@ -389,26 +389,38 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(t: Tensor, bits: int = 8, use_amax: bool = False) -> tuple[Tensor, Tensor]:
     max_val = (2 ** (bits - 1)) - 1  # 127 for int8, 7 for int4
     t32 = t.float()
     if t32.ndim == 2:
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / max_val).clamp_min(1.0 / max_val)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -max_val - 1, max_val).to(torch.int8).contiguous()
+        if use_amax:
+            # Match fake_quantize exactly: per-row amax scaling, no percentile clipping.
+            # Critical for int4 QAT where the 16-level budget can't tolerate scale mismatch.
+            row_max = t32.abs().amax(dim=1)
+            scale = row_max.clamp_min(1e-8) / max_val
+            q = torch.clamp(torch.round(t32 / scale[:, None]), -max_val - 1, max_val).to(torch.int8).contiguous()
+        else:
+            clip_abs = (
+                torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+                if t32.numel()
+                else torch.empty((t32.shape[0],), dtype=torch.float32)
+            )
+            clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+            scale = (clip_abs / max_val).clamp_min(1.0 / max_val)
+            q = torch.clamp(torch.round(clipped / scale[:, None]), -max_val - 1, max_val).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
 
+    if use_amax:
+        abs_max = float(t32.abs().max().item()) if t32.numel() else 0.0
+        scale = torch.tensor(max(abs_max, 1e-8) / max_val, dtype=torch.float32)
+        q = torch.clamp(torch.round(t32 / scale), -max_val - 1, max_val).to(torch.int8).contiguous()
+        return q, scale
     clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / max_val if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val - 1, max_val).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_amax: bool = False):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -446,7 +458,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t, bits=bits)
+        q, s = quantize_float_tensor(t, bits=bits, use_amax=use_amax)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -554,6 +566,7 @@ class DistributedTokenLoader:
 
     def next_batch(self, global_tokens: int, seq_len: int, grad_accum_steps: int) -> tuple[Tensor, Tensor]:
         local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        local_tokens = (local_tokens // seq_len) * seq_len  # floor to seq_len multiple
         per_rank_span = local_tokens + 1
         chunk = self.stream.take(per_rank_span * self.world_size)
         start = self.rank * per_rank_span
@@ -906,7 +919,7 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, max(args.train_seq_len, args.eval_seq_len))
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
@@ -1050,7 +1063,14 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        warmup_qat_step = max(1, args.warmup_steps // 2) if args.qat_bits > 0 else -1
         for warmup_step in range(args.warmup_steps):
+            # Pre-warm QAT graph in second half so torch.compile caches both variants
+            if warmup_step == warmup_qat_step:
+                for m in base_model.modules():
+                    if isinstance(m, CastedLinear):
+                        m._qat_bits = args.qat_bits
+                log0(f"warmup: pre-compiling QAT graph (bits={args.qat_bits})")
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -1068,6 +1088,10 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
+        if args.qat_bits > 0:
+            for m in base_model.modules():
+                if isinstance(m, CastedLinear):
+                    m._qat_bits = 0
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
@@ -1197,7 +1221,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bits=args.export_bits)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bits=args.export_bits, use_amax=(args.qat_bits > 0))
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()

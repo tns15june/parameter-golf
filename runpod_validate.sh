@@ -29,7 +29,7 @@ cd /workspace
 if [ ! -d "parameter-golf" ]; then
     git clone --branch submission-v1 https://github.com/tns15june/parameter-golf.git
 else
-    cd parameter-golf && git pull --ff-only && cd /workspace
+    cd parameter-golf && git checkout submission-v1 && git pull --ff-only && cd /workspace
 fi
 cd parameter-golf
 
@@ -143,7 +143,7 @@ run_experiment "depth_recurrence" \
     "Weight sharing + wider model — validates recurrence + U-Net skips" \
     1 \
     NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 NUM_LAYERS=12 \
-    MODEL_DIM=768 NUM_HEADS=8 NUM_KV_HEADS=4 || true
+    MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 || true
 
 # ----- STEP 5: QAT int4 (the submission config, ~10 min) -----
 echo ""
@@ -153,8 +153,8 @@ run_experiment "qat_int4" \
     "Full submission config minus eval features — validates QAT + compression" \
     1 \
     NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 NUM_LAYERS=12 \
-    MODEL_DIM=768 NUM_HEADS=8 NUM_KV_HEADS=4 \
-    QAT_BITS=4 QAT_START_FRAC=0.3 EXPORT_BITS=4 || true
+    MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 \
+    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 || true
 
 # ----- STEP 6: Eval-time features (RoPE + TTT, ~10 min) -----
 echo ""
@@ -164,8 +164,8 @@ run_experiment "eval_features" \
     "RoPE 4x context + TTT — validates eval-time optimization" \
     1 \
     NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 NUM_LAYERS=12 \
-    MODEL_DIM=768 NUM_HEADS=8 NUM_KV_HEADS=4 \
-    QAT_BITS=4 QAT_START_FRAC=0.3 EXPORT_BITS=4 \
+    MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 \
+    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 \
     EVAL_SEQ_LEN=4096 TTT_ENABLED=1 TTT_LR=1e-5 || true
 
 # ----- STEP 7: Multi-GPU (if available) -----
@@ -177,8 +177,8 @@ if [ "$NUM_GPUS" -ge 2 ]; then
         "DDP training on ${NUM_GPUS}× GPU — validates distributed code path" \
         "$NUM_GPUS" \
         NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 NUM_LAYERS=12 \
-        MODEL_DIM=768 NUM_HEADS=8 NUM_KV_HEADS=4 \
-        QAT_BITS=4 QAT_START_FRAC=0.3 EXPORT_BITS=4 \
+        MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 \
+        QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 \
         EVAL_SEQ_LEN=4096 TTT_ENABLED=1 TTT_LR=1e-5 || true
 else
     echo ""

@@ -10,12 +10,12 @@ cd /workspace
 
 # Clone from your fork
 if [ ! -d "parameter-golf" ]; then
-    git clone https://github.com/tns15june/parameter-golf.git
+    git clone --branch submission-v1 https://github.com/tns15june/parameter-golf.git
     cd parameter-golf
-    git checkout submission-v1
 else
     cd parameter-golf
-    git pull
+    git checkout submission-v1
+    git pull --ff-only
 fi
 
 # Download dataset
