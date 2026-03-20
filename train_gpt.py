@@ -81,6 +81,7 @@ class Hyperparameters:
     qat_bits = int(os.environ.get("QAT_BITS", "0"))
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", "0.3"))
     export_bits = int(os.environ.get("EXPORT_BITS", "8"))
+    embed_export_bits = int(os.environ.get("EMBED_EXPORT_BITS", os.environ.get("EXPORT_BITS", "8")))
 
     # Eval-time optimization.
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
@@ -420,7 +421,7 @@ def quantize_float_tensor(t: Tensor, bits: int = 8, use_amax: bool = False) -> t
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val - 1, max_val).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_amax: bool = False):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_amax: bool = False, embed_bits: int | None = None):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -458,7 +459,12 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_a
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t, bits=bits, use_amax=use_amax)
+        # Embedding: separate precision, no amax (not QAT-trained).
+        # Block weights: use main bits with amax matching fake_quantize.
+        is_embed = "tok_emb" in name
+        t_bits = embed_bits if (embed_bits is not None and is_embed) else bits
+        t_amax = use_amax and not is_embed
+        q, s = quantize_float_tensor(t, bits=t_bits, use_amax=t_amax)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -1016,7 +1022,7 @@ def main() -> None:
         f"effective_layers:{base_model.num_effective_layers}"
     )
     if args.qat_bits > 0:
-        log0(f"qat: bits={args.qat_bits} start_frac={args.qat_start_frac} export_bits={args.export_bits}")
+        log0(f"qat: bits={args.qat_bits} start_frac={args.qat_start_frac} export_bits={args.export_bits} embed_export_bits={args.embed_export_bits}")
     if args.eval_seq_len != args.train_seq_len:
         log0(f"eval: seq_len={args.eval_seq_len} rope_scale={args.eval_rope_scale} ttt={args.ttt_enabled}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1221,7 +1227,11 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bits=args.export_bits, use_amax=(args.qat_bits > 0))
+    embed_bits = args.embed_export_bits if args.embed_export_bits != args.export_bits else None
+    quant_obj, quant_stats = quantize_state_dict_int8(
+        base_model.state_dict(), bits=args.export_bits,
+        use_amax=(args.qat_bits > 0), embed_bits=embed_bits,
+    )
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1277,6 +1287,8 @@ def main() -> None:
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
     log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    export_gap = q_val_bpb - val_bpb
+    log0(f"export_gap:{export_gap:.4f} pre_export_bpb:{val_bpb:.4f} post_export_bpb:{q_val_bpb:.4f}")
 
     if distributed:
         dist.destroy_process_group()

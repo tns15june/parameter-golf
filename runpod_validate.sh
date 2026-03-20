@@ -1,21 +1,36 @@
 #!/bin/bash
 # =============================================================================
-# Parameter Golf — RunPod GPU Validation Script
+# Parameter Golf — Full-Dataset Validation Pipeline
 # =============================================================================
-# Usage: Just paste this entire script into RunPod terminal, or:
-#   bash runpod_validate.sh
+# Validates export pipeline integrity before spending on 8xH100.
+# Each experiment uses the FULL dataset and real wallclock budget.
 #
-# Requirements: RunPod pod with 1×H100 or 8×H100 (template y5cejece4j)
-# Cost estimate: ~$2-3 on 1×H100, ~$5-6 on 8×H100
+# Strategy: repair the scoring pipeline, then optimize the real objective.
+#   final_bpb = model_quality + export_gap + eval_gap
+#
+# Experiment order:
+#   1. no_qat_int8      — prove architecture is stable (int8 export)
+#   2. no_qat_mixed     — validate mixed-precision export (int4 blocks + int8 embed)
+#   3. qat_mixed        — validate QAT reduces int4 export gap
+#   4. eval_rope_only   — test RoPE scaling alone
+#   5. eval_ttt_only    — test TTT alone
+#
+# Requirements: RunPod pod with 1×H100+ and 50GB+ disk
+# Cost estimate: ~$4-5 on 1×H100 (~65 min total)
 # =============================================================================
 
-set -e  # Exit on first error
+set -e
 
 RESULTS_FILE="/workspace/parameter-golf/validation_results.txt"
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 
+# Score-aware thresholds
+MAX_EXPORT_GAP_INT8=0.02    # int8 gap must be < 0.02 BPB
+MAX_EXPORT_GAP_INT4=0.10    # int4 gap must be < 0.10 BPB
+MAX_ABSOLUTE_BPB=2.0        # sanity: BPB must be < 2.0
+
 echo "============================================================"
-echo "  PARAMETER GOLF — RUNPOD VALIDATION"
+echo "  PARAMETER GOLF — FULL-DATASET VALIDATION"
 echo "  $(date)"
 echo "  GPUs detected: $NUM_GPUS"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || true
@@ -23,7 +38,7 @@ echo "============================================================"
 
 # ----- STEP 1: Setup -----
 echo ""
-echo "[1/7] Setting up environment..."
+echo "[1/2] Setting up environment..."
 
 cd /workspace
 if [ ! -d "parameter-golf" ]; then
@@ -36,44 +51,68 @@ cd parameter-golf
 pip install -q -r requirements.txt 2>&1 | tail -3
 echo "Dependencies installed."
 
-# ----- STEP 2: Download data -----
+# ----- STEP 2: Download FULL dataset -----
 echo ""
-echo "[2/7] Downloading dataset..."
+echo "[2/2] Downloading FULL dataset (all shards)..."
 
-if [ -f "data/datasets/fineweb10B_sp1024/fineweb_val_000000.bin" ]; then
-    echo "Dataset already present, skipping download."
+TRAIN_SHARD_COUNT=$(ls data/datasets/fineweb10B_sp1024/fineweb_train_*.bin 2>/dev/null | wc -l)
+if [ "$TRAIN_SHARD_COUNT" -ge 80 ]; then
+    echo "Full dataset already present ($TRAIN_SHARD_COUNT train shards), skipping."
 else
+    echo "Downloading... (this takes 5-10 min, ~16GB)"
     python3 data/cached_challenge_fineweb.py --variant sp1024
 fi
-echo "Dataset ready."
+echo "Dataset ready: $(ls data/datasets/fineweb10B_sp1024/fineweb_train_*.bin | wc -l) train shards"
+
+# ----- Shared submission config (matches run_final.sh) -----
+SHARED_CONFIG=(
+    NUM_UNIQUE_LAYERS=3
+    NUM_RECURRENCES=4
+    NUM_LAYERS=12
+    MODEL_DIM=768
+    NUM_HEADS=12
+    NUM_KV_HEADS=6
+    MLP_MULT=2
+    VOCAB_SIZE=1024
+    TRAIN_SEQ_LEN=1024
+    TIE_EMBEDDINGS=1
+    ROPE_BASE=10000
+    LOGIT_SOFTCAP=30.0
+    TRAIN_BATCH_TOKENS=524288
+    MAX_WALLCLOCK_SECONDS=600
+    VAL_LOSS_EVERY=200
+    TRAIN_LOG_EVERY=50
+)
 
 # ----- Helper function -----
 run_experiment() {
     local name="$1"
     local description="$2"
-    local ngpus="$3"
-    shift 3
+    local gap_threshold="$3"
+    local ngpus="$4"
+    shift 4
     # Remaining args are KEY=VALUE env overrides
 
     echo ""
     echo "============================================================"
     echo "  EXPERIMENT: $name"
     echo "  $description"
-    echo "  GPUs: $ngpus"
+    echo "  GPUs: $ngpus | Gap threshold: $gap_threshold"
     echo "============================================================"
-
-    local logfile="logs/kaggle_${name}.txt"
 
     local start_time=$(date +%s)
 
-    # Build env string
+    # Build env string from shared config + overrides
     local env_cmd=""
+    for kv in "${SHARED_CONFIG[@]}"; do
+        env_cmd="$env_cmd $kv"
+    done
     for kv in "$@"; do
         env_cmd="$env_cmd $kv"
     done
 
     # Run with torchrun
-    set +e  # Don't exit on experiment failure
+    set +e
     env $env_cmd RUN_ID="validate_${name}" \
         torchrun --standalone --nproc_per_node="$ngpus" train_gpt.py \
         2>&1 | tee "/tmp/exp_${name}.log"
@@ -83,10 +122,11 @@ run_experiment() {
     local end_time=$(date +%s)
     local elapsed=$((end_time - start_time))
 
-    # Parse results
+    # Parse results from log
     local log_content=$(cat "/tmp/exp_${name}.log")
-    local val_bpb=$(echo "$log_content" | grep -oP 'final_int8_zlib_roundtrip val_loss:[\d.]+ val_bpb:\K[\d.]+' | tail -1)
-    local val_loss=$(echo "$log_content" | grep -oP 'final_int8_zlib_roundtrip val_loss:\K[\d.]+' | tail -1)
+    local post_bpb=$(echo "$log_content" | grep -oP 'post_export_bpb:\K[\d.]+' | tail -1)
+    local pre_bpb=$(echo "$log_content" | grep -oP 'pre_export_bpb:\K[\d.]+' | tail -1)
+    local export_gap=$(echo "$log_content" | grep -oP 'export_gap:\K[-\d.]+' | tail -1)
     local params=$(echo "$log_content" | grep -oP 'model_params:\K\d+' | tail -1)
     local compressed=$(echo "$log_content" | grep -oP 'Serialized model int8\+zlib: \K\d+' | tail -1)
     local peak_mem=$(echo "$log_content" | grep -oP 'peak memory allocated: \K\d+' | tail -1)
@@ -94,15 +134,37 @@ run_experiment() {
     local rope_scaled=$(echo "$log_content" | grep -c 'RoPE scaled:')
     local ttt_ran=$(echo "$log_content" | grep -c 'Running test-time training eval')
 
-    # Status
+    # Score-aware PASS/FAIL
     local status="FAIL"
-    if [ "$exit_code" -eq 0 ]; then
-        status="PASS"
+    local fail_reasons=""
+    if [ "$exit_code" -ne 0 ]; then
+        fail_reasons="crashed(exit=$exit_code)"
+    elif [ -z "$post_bpb" ]; then
+        fail_reasons="no_bpb_in_output"
+    else
+        # Check absolute BPB sanity
+        local bpb_ok=$(echo "$post_bpb < $MAX_ABSOLUTE_BPB" | bc -l 2>/dev/null || echo "0")
+        if [ "$bpb_ok" != "1" ]; then
+            fail_reasons="bpb=${post_bpb}>$MAX_ABSOLUTE_BPB"
+        fi
+        # Check export gap if threshold provided and gap available
+        if [ -n "$export_gap" ] && [ "$gap_threshold" != "none" ]; then
+            local gap_ok=$(echo "${export_gap#-} < $gap_threshold" | bc -l 2>/dev/null || echo "0")
+            if [ "$gap_ok" != "1" ]; then
+                fail_reasons="${fail_reasons:+$fail_reasons,}gap=${export_gap}>${gap_threshold}"
+            fi
+        fi
+        if [ -z "$fail_reasons" ]; then
+            status="PASS"
+        fi
     fi
 
     echo ""
-    echo "  >> Result: $status (exit=$exit_code, ${elapsed}s)"
-    [ -n "$val_bpb" ] && echo "  >> val_bpb=$val_bpb  val_loss=$val_loss"
+    echo "  >> Status: $status ${fail_reasons:+($fail_reasons)}"
+    echo "  >> Time: ${elapsed}s"
+    [ -n "$pre_bpb" ] && echo "  >> pre_export_bpb=$pre_bpb"
+    [ -n "$post_bpb" ] && echo "  >> post_export_bpb=$post_bpb"
+    [ -n "$export_gap" ] && echo "  >> export_gap=$export_gap"
     [ -n "$compressed" ] && echo "  >> compressed=${compressed} bytes  params=${params}"
     [ -n "$peak_mem" ] && echo "  >> peak_mem=${peak_mem} MiB"
     [ "$qat_activated" -gt 0 ] && echo "  >> QAT: activated"
@@ -110,12 +172,12 @@ run_experiment() {
     [ "$ttt_ran" -gt 0 ] && echo "  >> TTT: ran"
 
     # Append to results file
-    echo "$name | $status | bpb=$val_bpb | loss=$val_loss | params=$params | compressed=$compressed | mem=${peak_mem}MiB | ${elapsed}s | qat=$qat_activated rope=$rope_scaled ttt=$ttt_ran" >> "$RESULTS_FILE"
+    echo "$name | $status | pre=$pre_bpb | post=$post_bpb | gap=$export_gap | params=$params | compressed=$compressed | mem=${peak_mem}MiB | ${elapsed}s | qat=$qat_activated rope=$rope_scaled ttt=$ttt_ran${fail_reasons:+ | REASON=$fail_reasons}" >> "$RESULTS_FILE"
 
     if [ "$exit_code" -ne 0 ]; then
         echo ""
-        echo "  >> STDERR (last 20 lines):"
-        tail -20 "/tmp/exp_${name}.log" | sed 's/^/    /'
+        echo "  >> STDERR (last 30 lines):"
+        tail -30 "/tmp/exp_${name}.log" | sed 's/^/    /'
     fi
 
     return $exit_code
@@ -124,149 +186,185 @@ run_experiment() {
 # Initialize results file
 echo "PARAMETER GOLF VALIDATION RESULTS — $(date)" > "$RESULTS_FILE"
 echo "GPUs: $NUM_GPUS" >> "$RESULTS_FILE"
+echo "Config: NUM_HEADS=12 NUM_KV_HEADS=6 MODEL_DIM=768 3x4=12eff" >> "$RESULTS_FILE"
 echo "---" >> "$RESULTS_FILE"
 
-# ----- STEP 3: Smoke test (baseline, ~3 min) -----
+# =============================================================================
+# EXPERIMENT 1: Architecture baseline — no QAT, int8 export
+# Purpose: Prove the 12/6-head recurrent architecture is stable.
+#          Establish the int8 export gap baseline.
+# =============================================================================
 echo ""
-echo "[3/7] Smoke test: baseline training..."
+echo "============================================================"
+echo "  [1/5] Architecture baseline (no QAT, int8 export)"
+echo "============================================================"
 
-run_experiment "smoke_test" \
-    "Baseline 9 layers, dim=512, 100 iters — validates core training loop" \
+run_experiment "no_qat_int8" \
+    "Real submission arch, no QAT, int8 export — establish baseline BPB + gap" \
+    "$MAX_EXPORT_GAP_INT8" \
     1 \
-    ITERATIONS=100 VAL_LOSS_EVERY=100 WARMUP_STEPS=5 TRAIN_LOG_EVERY=20 || true
+    || true
 
-# ----- STEP 4: Depth recurrence (no QAT, ~10 min) -----
+# =============================================================================
+# EXPERIMENT 2: Mixed-precision export — int4 blocks + int8 embedding
+# Purpose: Validate mixed-precision export without QAT.
+#          Embedding (tok_emb) stays int8, block matrices go int4.
+#          Should show the raw int4 export penalty on untrained weights.
+# =============================================================================
 echo ""
-echo "[4/7] Depth recurrence: 3 unique × 4 rec = 12 effective, dim=768..."
+echo "============================================================"
+echo "  [2/5] Mixed-precision export (int4 blocks + int8 embed, no QAT)"
+echo "============================================================"
 
-run_experiment "depth_recurrence" \
-    "Weight sharing + wider model — validates recurrence + U-Net skips" \
+run_experiment "no_qat_mixed" \
+    "No QAT, EXPORT_BITS=4 EMBED_EXPORT_BITS=8 — raw int4 penalty on blocks" \
+    "$MAX_EXPORT_GAP_INT4" \
     1 \
-    NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 NUM_LAYERS=12 \
-    MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 || true
+    EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
+    || true
 
-# ----- STEP 5: QAT int4 (the submission config, ~10 min) -----
+# =============================================================================
+# EXPERIMENT 3: QAT + mixed-precision export
+# Purpose: Validate that QAT closes the int4 export gap.
+#          This is the core submission config (minus eval tricks).
+# =============================================================================
 echo ""
-echo "[5/7] QAT int4: recurrence + fake quantization + int4 export..."
+echo "============================================================"
+echo "  [3/5] QAT + mixed-precision export"
+echo "============================================================"
 
-run_experiment "qat_int4" \
-    "Full submission config minus eval features — validates QAT + compression" \
+run_experiment "qat_mixed" \
+    "QAT_BITS=4 + EXPORT_BITS=4 + EMBED_EXPORT_BITS=8 — QAT should close gap" \
+    "$MAX_EXPORT_GAP_INT4" \
     1 \
-    NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 NUM_LAYERS=12 \
-    MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 \
-    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 || true
+    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
+    || true
 
-# ----- STEP 6: Eval-time features (RoPE + TTT, ~10 min) -----
+# =============================================================================
+# EXPERIMENT 4: RoPE scaling alone (on best training config so far)
+# Purpose: Isolate the effect of longer eval context.
+#          Uses QAT + mixed export from exp3 as base.
+# =============================================================================
 echo ""
-echo "[6/7] Eval-time features: RoPE scaling + test-time training..."
+echo "============================================================"
+echo "  [4/5] RoPE 4x context scaling (no TTT)"
+echo "============================================================"
 
-run_experiment "eval_features" \
-    "RoPE 4x context + TTT — validates eval-time optimization" \
+run_experiment "eval_rope_only" \
+    "QAT mixed + EVAL_SEQ_LEN=4096 — isolate RoPE scaling effect" \
+    "none" \
     1 \
-    NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 NUM_LAYERS=12 \
-    MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 \
-    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 \
-    EVAL_SEQ_LEN=4096 TTT_ENABLED=1 TTT_LR=1e-5 || true
+    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
+    EVAL_SEQ_LEN=4096 \
+    || true
 
-# ----- STEP 7: Multi-GPU (if available) -----
-if [ "$NUM_GPUS" -ge 2 ]; then
-    echo ""
-    echo "[7/7] Multi-GPU DDP: $NUM_GPUS GPUs..."
+# =============================================================================
+# EXPERIMENT 5: TTT alone (on best training config so far)
+# Purpose: Isolate the effect of test-time training.
+#          Uses QAT + mixed export from exp3 as base.
+# =============================================================================
+echo ""
+echo "============================================================"
+echo "  [5/5] Test-time training (no RoPE scaling)"
+echo "============================================================"
 
-    run_experiment "multi_gpu" \
-        "DDP training on ${NUM_GPUS}× GPU — validates distributed code path" \
-        "$NUM_GPUS" \
-        NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 NUM_LAYERS=12 \
-        MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 \
-        QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 \
-        EVAL_SEQ_LEN=4096 TTT_ENABLED=1 TTT_LR=1e-5 || true
-else
-    echo ""
-    echo "[7/7] SKIP: Multi-GPU (only $NUM_GPUS GPU available)"
-    echo "multi_gpu | SKIP | only $NUM_GPUS GPU" >> "$RESULTS_FILE"
-fi
+run_experiment "eval_ttt_only" \
+    "QAT mixed + TTT_ENABLED=1 — isolate TTT effect at train_seq_len" \
+    "none" \
+    1 \
+    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
+    TTT_ENABLED=1 TTT_LR=1e-5 \
+    || true
 
-# ----- SUMMARY -----
+# =============================================================================
+# SUMMARY
+# =============================================================================
 echo ""
 echo ""
 echo "============================================================"
-echo "  FINAL RESULTS SUMMARY"
+echo "  VALIDATION RESULTS"
 echo "============================================================"
 echo ""
 
 # Print results table
-printf "%-20s %-6s %-10s %-10s %-12s %-14s %-10s %-8s\n" \
-    "Experiment" "Status" "BPB" "Loss" "Params" "Compressed" "Peak MiB" "Time"
-printf "%-20s %-6s %-10s %-10s %-12s %-14s %-10s %-8s\n" \
-    "--------------------" "------" "----------" "----------" "------------" "--------------" "----------" "--------"
+printf "%-18s %-6s %-10s %-10s %-10s %-12s %-10s %-8s\n" \
+    "Experiment" "Status" "Pre BPB" "Post BPB" "Gap" "Compressed" "Peak MiB" "Time"
+printf "%-18s %-6s %-10s %-10s %-10s %-12s %-10s %-8s\n" \
+    "------------------" "------" "----------" "----------" "----------" "------------" "----------" "--------"
 
 while IFS='|' read -r name status rest; do
     name=$(echo "$name" | xargs)
     status=$(echo "$status" | xargs)
 
-    bpb=$(echo "$rest" | grep -oP 'bpb=\K[\d.]+' || echo "N/A")
-    loss=$(echo "$rest" | grep -oP 'loss=\K[\d.]+' || echo "N/A")
-    params=$(echo "$rest" | grep -oP 'params=\K\d+' || echo "N/A")
+    pre=$(echo "$rest" | grep -oP 'pre=\K[\d.]+' || echo "N/A")
+    post=$(echo "$rest" | grep -oP 'post=\K[\d.]+' || echo "N/A")
+    gap=$(echo "$rest" | grep -oP 'gap=\K[-\d.]+' || echo "N/A")
     compressed=$(echo "$rest" | grep -oP 'compressed=\K\d+' || echo "N/A")
     mem=$(echo "$rest" | grep -oP 'mem=\K\d+' || echo "N/A")
     elapsed=$(echo "$rest" | grep -oP '\d+s' | head -1 || echo "N/A")
 
     [ "$name" = "---" ] && continue
-    echo "$name" | grep -q "PARAMETER GOLF" && continue
-    echo "$name" | grep -q "GPUs:" && continue
+    echo "$name" | grep -qE "PARAMETER GOLF|GPUs:|Config:" && continue
 
-    printf "%-20s %-6s %-10s %-10s %-12s %-14s %-10s %-8s\n" \
-        "$name" "$status" "$bpb" "$loss" "$params" "$compressed" "$mem" "$elapsed"
+    printf "%-18s %-6s %-10s %-10s %-10s %-12s %-10s %-8s\n" \
+        "$name" "$status" "$pre" "$post" "$gap" "$compressed" "$mem" "$elapsed"
 done < "$RESULTS_FILE"
 
-# Feature checklist
+# Score-based analysis
 echo ""
-echo "FEATURE CHECKLIST:"
+echo "ANALYSIS:"
 results_content=$(cat "$RESULTS_FILE")
 
-check_feature() {
-    local label="$1"
-    local pattern="$2"
-    if echo "$results_content" | grep -q "$pattern"; then
-        echo "  [PASS] $label"
-    else
-        echo "  [FAIL] $label"
-    fi
-}
-
-check_pass() {
+# Check each experiment
+check_experiment() {
     local label="$1"
     local exp_name="$2"
-    if echo "$results_content" | grep "^$exp_name" | grep -q "PASS"; then
+    local line=$(echo "$results_content" | grep "^$exp_name ")
+    if [ -z "$line" ]; then
+        echo "  [SKIP] $label"
+        return
+    fi
+    local status=$(echo "$line" | cut -d'|' -f2 | xargs)
+    if [ "$status" = "PASS" ]; then
         echo "  [PASS] $label"
     else
-        echo "  [FAIL] $label"
+        local reason=$(echo "$line" | grep -oP 'REASON=\K[^|]+' || echo "unknown")
+        echo "  [FAIL] $label ($reason)"
     fi
 }
 
-check_pass "Core training loop + torch.compile" "smoke_test"
-check_pass "Depth recurrence (weight sharing)" "depth_recurrence"
-check_pass "QAT int4 + zlib compression" "qat_int4"
-check_pass "Eval-time features (RoPE + TTT)" "eval_features"
+check_experiment "Architecture stable (int8 export)" "no_qat_int8"
+check_experiment "Mixed-precision export (int4+int8)" "no_qat_mixed"
+check_experiment "QAT closes int4 gap" "qat_mixed"
+check_experiment "RoPE scaling" "eval_rope_only"
+check_experiment "Test-time training" "eval_ttt_only"
 
-if [ "$NUM_GPUS" -ge 2 ]; then
-    check_pass "Multi-GPU DDP" "multi_gpu"
-else
-    echo "  [SKIP] Multi-GPU DDP (single GPU pod)"
-fi
-
-# Size check
-compressed_bytes=$(echo "$results_content" | grep "qat_int4" | grep -oP 'compressed=\K\d+' || echo "0")
+# Size check from best QAT experiment
+compressed_bytes=$(echo "$results_content" | grep "qat_mixed" | grep -oP 'compressed=\K\d+' || echo "0")
 if [ -f "train_gpt.py" ] && [ "$compressed_bytes" -gt 0 ]; then
     code_bytes=$(wc -c < train_gpt.py)
     total=$((compressed_bytes + code_bytes))
     limit=16000000
+    echo ""
     if [ "$total" -lt "$limit" ]; then
-        echo "  [PASS] Size budget: ${total} bytes (code=${code_bytes} + model=${compressed_bytes}) < 16MB"
+        headroom=$((limit - total))
+        echo "  [PASS] Size: ${total} bytes (code=${code_bytes} + model=${compressed_bytes}) — ${headroom} bytes headroom"
     else
-        echo "  [FAIL] Size budget: ${total} bytes EXCEEDS 16MB limit!"
+        echo "  [FAIL] Size: ${total} bytes EXCEEDS 16MB limit!"
     fi
 fi
+
+# Decision guide
+echo ""
+echo "NEXT STEPS:"
+echo "  If no_qat_int8 PASS + gap < 0.01:"
+echo "    Architecture is solid. Proceed to mixed-precision export."
+echo "  If no_qat_mixed PASS + gap < 0.05:"
+echo "    Mixed export works. Add QAT to close gap further."
+echo "  If qat_mixed PASS + gap < 0.03:"
+echo "    Ready for eval tricks. Check rope/ttt for improvement."
+echo "  If qat_mixed FAIL (gap too large):"
+echo "    Debug export mismatch. Try EXPORT_BITS=8 with bigger model."
 
 echo ""
 echo "Full results: $RESULTS_FILE"
