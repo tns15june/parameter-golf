@@ -142,14 +142,14 @@ run_experiment() {
     elif [ -z "$post_bpb" ]; then
         fail_reasons="no_bpb_in_output"
     else
-        # Check absolute BPB sanity
-        local bpb_ok=$(echo "$post_bpb < $MAX_ABSOLUTE_BPB" | bc -l 2>/dev/null || echo "0")
+        # Check absolute BPB sanity (use python3 instead of bc — bc not always installed)
+        local bpb_ok=$(python3 -c "print(1 if $post_bpb < $MAX_ABSOLUTE_BPB else 0)" 2>/dev/null || echo "0")
         if [ "$bpb_ok" != "1" ]; then
             fail_reasons="bpb=${post_bpb}>$MAX_ABSOLUTE_BPB"
         fi
         # Check export gap if threshold provided and gap available
         if [ -n "$export_gap" ] && [ "$gap_threshold" != "none" ]; then
-            local gap_ok=$(echo "${export_gap#-} < $gap_threshold" | bc -l 2>/dev/null || echo "0")
+            local gap_ok=$(python3 -c "print(1 if abs($export_gap) < $gap_threshold else 0)" 2>/dev/null || echo "0")
             if [ "$gap_ok" != "1" ]; then
                 fail_reasons="${fail_reasons:+$fail_reasons,}gap=${export_gap}>${gap_threshold}"
             fi
