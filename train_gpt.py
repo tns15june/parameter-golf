@@ -576,17 +576,11 @@ class RMSNorm(nn.Module):
 
 
 def fake_quantize(weight: Tensor, bits: int = 8) -> Tensor:
-    """STE fake quantization: forward quantizes, backward passes gradient through.
-    Must match quantize_float_tensor exactly: percentile clipping + per-row scale."""
+    """STE fake quantization: forward quantizes, backward passes gradient through."""
     max_val = (2 ** (bits - 1)) - 1
     with torch.no_grad():
-        if weight.ndim == 2:
-            clip_abs = torch.quantile(weight.abs().float(), INT8_CLIP_Q, dim=1, keepdim=True)
-        else:
-            clip_abs = torch.quantile(weight.abs().float().flatten(), INT8_CLIP_Q).unsqueeze(0)
-        scale = (clip_abs / max_val).clamp_min(1e-8)
-    clipped = torch.clamp(weight, -clip_abs, clip_abs)
-    q = torch.round(clipped / scale).clamp(-max_val - 1, max_val)
+        scale = weight.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / max_val
+    q = torch.round(weight / scale).clamp(-max_val - 1, max_val)
     return weight + (q * scale - weight).detach()
 
 
