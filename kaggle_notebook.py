@@ -7,8 +7,8 @@ Validates every code path in train_gpt.py without modifying the source.
 All compatibility fixes are runtime monkey-patches applied before each run.
 
 Usage on Kaggle:
-  1. Upload this repo (or clone from GitHub) as a Kaggle dataset or use !git clone
-  2. Select "GPU T4 x2" accelerator
+  1. Create a new Kaggle notebook, select "GPU T4 x2" accelerator, enable Internet
+  2. Paste this entire file into a single cell (or upload as notebook)
   3. Run all cells top-to-bottom (~45 min total)
 """
 
@@ -19,20 +19,18 @@ Usage on Kaggle:
 import subprocess, sys, os, json, time, re, textwrap
 from pathlib import Path
 
-# ---------- locate repo root ----------
-# Works whether this file lives inside the repo or Kaggle copies it to /kaggle/working
+# ---------- clone repo ----------
 REPO_DIR = Path("/kaggle/working/parameter-golf")
 if not REPO_DIR.exists():
-    # Try current directory (if already in repo)
-    candidate = Path(__file__).resolve().parent if "__file__" in dir() else Path.cwd()
-    if (candidate / "train_gpt.py").exists():
-        REPO_DIR = candidate
-    else:
-        print("Cloning repo...")
-        subprocess.run(
-            ["git", "clone", "https://github.com/tns15june/parameter-golf.git", str(REPO_DIR)],
-            check=True,
-        )
+    print("Cloning repo from GitHub...")
+    subprocess.run(
+        ["git", "clone", "--branch", "submission-v1",
+         "https://github.com/tns15june/parameter-golf.git", str(REPO_DIR)],
+        check=True,
+    )
+else:
+    # Pull latest changes if repo already cloned
+    subprocess.run(["git", "-C", str(REPO_DIR), "pull", "--ff-only"], check=False)
 
 os.chdir(REPO_DIR)
 print(f"Working directory: {REPO_DIR}")
