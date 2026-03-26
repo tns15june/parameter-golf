@@ -50,7 +50,7 @@ case "${1:-baseline}" in
   qat4)
     echo "=== int4 QAT + wider model ==="
     eval "$COMMON NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 \
-    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 \
+    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
     RUN_ID=exp_qat4_3x4_768 \
     torchrun --standalone --nproc_per_node=1 train_gpt.py"
     ;;
