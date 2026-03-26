@@ -89,6 +89,11 @@ class Hyperparameters:
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", "1e-5"))
 
+    # N-gram eval cache.
+    ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "0")))
+    ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", "5"))
+    ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.2"))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -358,6 +363,103 @@ def eval_val_ttt(
     bpt = val_loss.item() / math.log(2.0)
     tpb = val_token_count.item() / val_byte_count.item()
     return float(val_loss.item()), float(bpt * tpb)
+
+
+def eval_val_ngram(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    """Evaluate with n-gram cache: blend model predictions with empirical n-gram counts."""
+    seq_len = args.eval_seq_len
+    max_order = args.ngram_max_order
+    alpha = args.ngram_alpha
+
+    total_seqs = (val_tokens.numel() - 1) // seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+
+    # N-gram caches by order: {context_tuple: {next_token: count}}
+    caches: list[dict] = [dict() for _ in range(max_order + 1)]
+
+    val_loss_sum = 0.0
+    val_token_count = 0.0
+    val_byte_count = 0.0
+
+    tok = val_tokens.tolist()
+    blut = base_bytes_lut.cpu().tolist()
+    slut = has_leading_space_lut.cpu().tolist()
+    bout = is_boundary_token_lut.cpu().tolist()
+
+    model.eval()
+    with torch.inference_mode():
+        for seq_idx in range(seq_start, seq_end):
+            start = seq_idx * seq_len
+            x = val_tokens[start : start + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
+
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(x)  # (1, seq_len, vocab)
+
+            tgt = val_tokens[start + 1 : start + seq_len + 1].to(device=device, dtype=torch.int64)
+            lp_all = F.log_softmax(logits[0].float(), dim=-1)
+            tgt_lps = lp_all.gather(1, tgt.unsqueeze(1)).squeeze(1).cpu().tolist()
+
+            for pos in range(seq_len):
+                tp = start + pos
+                target = tok[tp + 1]
+                model_lp = tgt_lps[pos]
+
+                # N-gram backoff lookup
+                ngram_p = 0.0
+                found = False
+                for order in range(max_order, 1, -1):
+                    if tp + 1 >= order:
+                        ctx = tuple(tok[tp + 2 - order : tp + 1])
+                        c = caches[order].get(ctx)
+                        if c is not None:
+                            total = sum(c.values())
+                            ngram_p = c.get(target, 0) / total
+                            found = True
+                            break
+
+                if found and ngram_p > 0:
+                    blended = (1.0 - alpha) * math.exp(model_lp) + alpha * ngram_p
+                    val_loss_sum -= math.log(max(blended, 1e-30))
+                else:
+                    val_loss_sum -= model_lp
+
+                val_token_count += 1
+                tb = blut[target]
+                if slut[target] and not bout[tok[tp]]:
+                    tb += 1
+                val_byte_count += tb
+
+                # Update caches
+                for order in range(2, max_order + 1):
+                    if tp + 1 >= order:
+                        ctx = tuple(tok[tp + 2 - order : tp + 1])
+                        cache = caches[order]
+                        if ctx not in cache:
+                            cache[ctx] = {}
+                        cache[ctx][target] = cache[ctx].get(target, 0) + 1
+
+    if dist.is_available() and dist.is_initialized():
+        ts = [torch.tensor(v, device=device, dtype=torch.float64) for v in (val_loss_sum, val_token_count, val_byte_count)]
+        for t in ts:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        val_loss_sum, val_token_count, val_byte_count = (t.item() for t in ts)
+
+    val_loss = val_loss_sum / val_token_count
+    bpt = val_loss / math.log(2.0)
+    tpb = val_token_count / val_byte_count
+    return float(val_loss), float(bpt * tpb)
+
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -813,7 +915,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -836,8 +938,7 @@ class GPT(nn.Module):
                     self.resid_mixes[eff_i], self.q_gains[eff_i],
                 )
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
@@ -845,7 +946,9 @@ class GPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        if target_ids is None:
+            return logits
+        return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), target_ids.reshape(-1), reduction="mean")
 
 
 # -----------------------------
@@ -1286,7 +1389,13 @@ def main() -> None:
 
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    if args.ttt_enabled:
+    if args.ngram_enabled:
+        log0(f"Running n-gram eval (max_order={args.ngram_max_order}, alpha={args.ngram_alpha})...")
+        q_val_loss, q_val_bpb = eval_val_ngram(
+            args, base_model, rank, world_size, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+    elif args.ttt_enabled:
         log0("Running test-time training eval...")
         q_val_loss, q_val_bpb = eval_val_ttt(
             args, base_model, rank, world_size, device, val_tokens,
