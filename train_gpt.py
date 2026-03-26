@@ -415,20 +415,17 @@ def eval_val_ngram(
                 target = tok[tp + 1]
                 model_lp = tgt_lps[pos]
 
-                # N-gram backoff lookup
+                # N-gram backoff lookup: find highest order with target in cache
                 ngram_p = 0.0
-                found = False
                 for order in range(max_order, 1, -1):
                     if tp + 1 >= order:
                         ctx = tuple(tok[tp + 2 - order : tp + 1])
                         c = caches[order].get(ctx)
-                        if c is not None:
-                            total = sum(c.values())
-                            ngram_p = c.get(target, 0) / total
-                            found = True
+                        if c is not None and target in c:
+                            ngram_p = c[target] / sum(c.values())
                             break
 
-                if found and ngram_p > 0:
+                if ngram_p > 0:
                     blended = (1.0 - alpha) * math.exp(model_lp) + alpha * ngram_p
                     val_loss_sum -= math.log(max(blended, 1e-30))
                 else:
