@@ -19,6 +19,7 @@ import subprocess
 import sys
 import time
 import uuid
+import lzma
 import zlib
 from pathlib import Path
 
@@ -93,6 +94,9 @@ class Hyperparameters:
     ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "0")))
     ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", "5"))
     ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.2"))
+
+    # Compression: "zlib" (default) or "lzma" (better ratio, slower).
+    compress_method = os.environ.get("COMPRESS_METHOD", "zlib")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1345,25 +1349,33 @@ def main() -> None:
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
+    if args.compress_method == "lzma":
+        quant_blob = lzma.compress(quant_raw, preset=9 | lzma.PRESET_EXTREME)
+    else:
+        quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
+    export_file = "final_model.int8.ptz"
     if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
+        with open(export_file, "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+        quant_file_bytes = os.path.getsize(export_file)
         code_bytes = len(code.encode("utf-8"))
         ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"Serialized model {args.compress_method}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
+    with open(export_file, "rb") as f:
         quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+    try:
+        decompressed = lzma.decompress(quant_blob_disk)
+    except lzma.LZMAError:
+        decompressed = zlib.decompress(quant_blob_disk)
+    quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
 
     # Clear QAT bits — we are evaluating the exported artifact, not training.
