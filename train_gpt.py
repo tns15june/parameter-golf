@@ -97,6 +97,8 @@ class Hyperparameters:
 
     # Compression: "zlib" (default) or "lzma" (better ratio, slower).
     compress_method = os.environ.get("COMPRESS_METHOD", "zlib")
+    if compress_method not in ("zlib", "lzma"):
+        raise ValueError(f"COMPRESS_METHOD must be 'zlib' or 'lzma', got '{compress_method}'")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -395,6 +397,7 @@ def eval_val_ngram(
     val_loss_sum = 0.0
     val_token_count = 0.0
     val_byte_count = 0.0
+    ngram_hits = 0
 
     tok = val_tokens.tolist()
     blut = base_bytes_lut.cpu().tolist()
@@ -430,6 +433,7 @@ def eval_val_ngram(
                             break
 
                 if ngram_p > 0:
+                    ngram_hits += 1
                     blended = (1.0 - alpha) * math.exp(model_lp) + alpha * ngram_p
                     val_loss_sum -= math.log(max(blended, 1e-30))
                 else:
@@ -455,6 +459,13 @@ def eval_val_ngram(
         for t in ts:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         val_loss_sum, val_token_count, val_byte_count = (t.item() for t in ts)
+        hits_t = torch.tensor(ngram_hits, device=device, dtype=torch.float64)
+        dist.all_reduce(hits_t, op=dist.ReduceOp.SUM)
+        ngram_hits = int(hits_t.item())
+
+    if rank == 0:
+        hit_rate = ngram_hits / max(val_token_count, 1)
+        print(f"ngram_hit_rate:{hit_rate:.4f} hits:{ngram_hits} total:{int(val_token_count)}")
 
     val_loss = val_loss_sum / val_token_count
     bpt = val_loss / math.log(2.0)
@@ -504,7 +515,9 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
     return t
 
 def quantize_float_tensor(t: Tensor, bits: int = 8, use_amax: bool = False) -> tuple[Tensor, Tensor]:
-    max_val = (2 ** (bits - 1)) - 1  # 127 for int8, 7 for int4
+    if bits < 2 or bits > 8:
+        raise ValueError(f"Export bits must be in [2, 8], got {bits}. Values are stored in int8 containers.")
+    max_val = (2 ** (bits - 1)) - 1  # 127 for int8, 31 for int6, 7 for int4
     t32 = t.float()
     if t32.ndim == 2:
         if use_amax:
@@ -1354,7 +1367,7 @@ def main() -> None:
     else:
         quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
-    export_file = "final_model.int8.ptz"
+    export_file = f"final_model.int{args.export_bits}.{args.compress_method}.ptz"
     if master_process:
         with open(export_file, "wb") as f:
             f.write(quant_blob)
@@ -1371,9 +1384,9 @@ def main() -> None:
         dist.barrier()
     with open(export_file, "rb") as f:
         quant_blob_disk = f.read()
-    try:
+    if args.compress_method == "lzma":
         decompressed = lzma.decompress(quant_blob_disk)
-    except lzma.LZMAError:
+    else:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
@@ -1385,7 +1398,7 @@ def main() -> None:
         if isinstance(m, CastedLinear):
             m._qat_bits = 0
 
-    # NTK-aware RoPE scaling for longer eval context
+    # Linear RoPE base scaling for longer eval context
     if args.eval_seq_len > args.train_seq_len:
         rope_scale = args.eval_rope_scale if args.eval_rope_scale > 0 else (args.eval_seq_len / args.train_seq_len)
         for block in base_model.blocks:
@@ -1400,12 +1413,16 @@ def main() -> None:
     t_qeval = time.perf_counter()
     if args.ngram_enabled:
         log0(f"Running n-gram eval (max_order={args.ngram_max_order}, alpha={args.ngram_alpha})...")
+        if world_size > 1:
+            log0(f"WARNING: n-gram caches are per-rank (not shared). BPB with {world_size} GPUs may differ from single-GPU eval.")
         q_val_loss, q_val_bpb = eval_val_ngram(
             args, base_model, rank, world_size, device, val_tokens,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
     elif args.ttt_enabled:
         log0("Running test-time training eval...")
+        if world_size > 1:
+            log0(f"WARNING: TTT adapts independently per rank. BPB with {world_size} GPUs may differ from single-GPU eval.")
         q_val_loss, q_val_bpb = eval_val_ttt(
             args, base_model, rank, world_size, device, val_tokens,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,

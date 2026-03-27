@@ -66,12 +66,11 @@ echo "Dataset ready: $(ls data/datasets/fineweb10B_sp1024/fineweb_train_*.bin | 
 
 # ----- Shared submission config (matches run_final.sh) -----
 SHARED_CONFIG=(
-    NUM_UNIQUE_LAYERS=3
-    NUM_RECURRENCES=4
-    NUM_LAYERS=12
-    MODEL_DIM=768
-    NUM_HEADS=12
-    NUM_KV_HEADS=6
+    NUM_UNIQUE_LAYERS=9
+    NUM_RECURRENCES=1
+    MODEL_DIM=512
+    NUM_HEADS=8
+    NUM_KV_HEADS=4
     MLP_MULT=2
     VOCAB_SIZE=1024
     TRAIN_SEQ_LEN=1024
@@ -128,7 +127,7 @@ run_experiment() {
     local pre_bpb=$(echo "$log_content" | grep -oP 'pre_export_bpb:\K[\d.]+' | tail -1)
     local export_gap=$(echo "$log_content" | grep -oP 'export_gap:\K[-\d.]+' | tail -1)
     local params=$(echo "$log_content" | grep -oP 'model_params:\K\d+' | tail -1)
-    local compressed=$(echo "$log_content" | grep -oP 'Serialized model int8\+zlib: \K\d+' | tail -1)
+    local compressed=$(echo "$log_content" | grep -oP 'Serialized model \w+: \K\d+' | tail -1)
     local peak_mem=$(echo "$log_content" | grep -oP 'peak memory allocated: \K\d+' | tail -1)
     local qat_activated=$(echo "$log_content" | grep -c 'QAT enabled at step')
     local rope_scaled=$(echo "$log_content" | grep -c 'RoPE scaled:')
@@ -186,12 +185,12 @@ run_experiment() {
 # Initialize results file
 echo "PARAMETER GOLF VALIDATION RESULTS — $(date)" > "$RESULTS_FILE"
 echo "GPUs: $NUM_GPUS" >> "$RESULTS_FILE"
-echo "Config: NUM_HEADS=12 NUM_KV_HEADS=6 MODEL_DIM=768 3x4=12eff" >> "$RESULTS_FILE"
+echo "Config: NUM_HEADS=8 NUM_KV_HEADS=4 MODEL_DIM=512 9x1=9eff" >> "$RESULTS_FILE"
 echo "---" >> "$RESULTS_FILE"
 
 # =============================================================================
 # EXPERIMENT 1: Architecture baseline — no QAT, int8 export
-# Purpose: Prove the 12/6-head recurrent architecture is stable.
+# Purpose: Prove 9L/512d architecture is stable with int8 export.
 #          Establish the int8 export gap baseline.
 # =============================================================================
 echo ""
@@ -200,80 +199,79 @@ echo "  [1/5] Architecture baseline (no QAT, int8 export)"
 echo "============================================================"
 
 run_experiment "no_qat_int8" \
-    "Real submission arch, no QAT, int8 export — establish baseline BPB + gap" \
+    "9L/512d baseline, no QAT, int8+zlib export — establish baseline BPB + gap" \
     "$MAX_EXPORT_GAP_INT8" \
     1 \
     || true
 
 # =============================================================================
-# EXPERIMENT 2: Mixed-precision export — int4 blocks + int8 embedding
-# Purpose: Validate mixed-precision export without QAT.
-#          Embedding (tok_emb) stays int8, block matrices go int4.
-#          Should show the raw int4 export penalty on untrained weights.
+# EXPERIMENT 2: int6 export + int8 embedding (no QAT, zlib)
+# Purpose: Validate int6 mixed-precision export.
+#          Embedding (tok_emb) stays int8, block matrices go int6.
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "  [2/5] Mixed-precision export (int4 blocks + int8 embed, no QAT)"
+echo "  [2/5] Mixed-precision export (int6 blocks + int8 embed, zlib)"
 echo "============================================================"
 
-run_experiment "no_qat_mixed" \
-    "No QAT, EXPORT_BITS=4 EMBED_EXPORT_BITS=8 — raw int4 penalty on blocks" \
+run_experiment "no_qat_int6_zlib" \
+    "No QAT, EXPORT_BITS=6 EMBED_EXPORT_BITS=8 — int6 gap with zlib" \
     "$MAX_EXPORT_GAP_INT4" \
     1 \
-    EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
+    EXPORT_BITS=6 EMBED_EXPORT_BITS=8 \
     || true
 
 # =============================================================================
-# EXPERIMENT 3: QAT + mixed-precision export
-# Purpose: Validate that QAT closes the int4 export gap.
-#          This is the core submission config (minus eval tricks).
+# EXPERIMENT 3: int6 export + LZMA compression (submission config minus eval tricks)
+# Purpose: Validate the actual submission export pipeline.
+#          This is the core submission config.
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "  [3/5] QAT + mixed-precision export"
+echo "  [3/5] int6 + LZMA export (submission core)"
 echo "============================================================"
 
-run_experiment "qat_mixed" \
-    "QAT_BITS=4 + EXPORT_BITS=4 + EMBED_EXPORT_BITS=8 — QAT should close gap" \
+run_experiment "int6_lzma" \
+    "EXPORT_BITS=6 EMBED_EXPORT_BITS=8 COMPRESS_METHOD=lzma — submission export" \
     "$MAX_EXPORT_GAP_INT4" \
     1 \
-    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
+    EXPORT_BITS=6 EMBED_EXPORT_BITS=8 COMPRESS_METHOD=lzma \
     || true
 
 # =============================================================================
-# EXPERIMENT 4: RoPE scaling alone (on best training config so far)
-# Purpose: Isolate the effect of longer eval context.
-#          Uses QAT + mixed export from exp3 as base.
+# EXPERIMENT 4: N-gram eval on int6+LZMA export
+# Purpose: Validate n-gram eval cache on the submission export.
+#          This is the full submission config.
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "  [4/5] RoPE 4x context scaling (no TTT)"
+echo "  [4/5] N-gram eval on int6+LZMA"
 echo "============================================================"
 
-run_experiment "eval_rope_only" \
-    "QAT mixed + EVAL_SEQ_LEN=4096 — isolate RoPE scaling effect" \
+run_experiment "int6_lzma_ngram" \
+    "int6+LZMA + NGRAM_ENABLED=1 — full submission config" \
     "none" \
     1 \
-    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
+    EXPORT_BITS=6 EMBED_EXPORT_BITS=8 COMPRESS_METHOD=lzma \
+    NGRAM_ENABLED=1 NGRAM_MAX_ORDER=5 NGRAM_ALPHA=0.2 \
+    || true
+
+# =============================================================================
+# EXPERIMENT 5: RoPE 4x context scaling on int6+LZMA
+# Purpose: Test whether RoPE scaling helps or hurts on int6 export.
+#          Prior result: adds ~0.02 to gap on int4, may be smaller on int6.
+# =============================================================================
+echo ""
+echo "============================================================"
+echo "  [5/5] RoPE 4x scaling on int6+LZMA"
+echo "============================================================"
+
+run_experiment "int6_lzma_rope" \
+    "int6+LZMA + EVAL_SEQ_LEN=4096 — test RoPE scaling on int6 export" \
+    "none" \
+    1 \
+    EXPORT_BITS=6 EMBED_EXPORT_BITS=8 COMPRESS_METHOD=lzma \
     EVAL_SEQ_LEN=4096 \
-    || true
-
-# =============================================================================
-# EXPERIMENT 5: TTT alone (on best training config so far)
-# Purpose: Isolate the effect of test-time training.
-#          Uses QAT + mixed export from exp3 as base.
-# =============================================================================
-echo ""
-echo "============================================================"
-echo "  [5/5] Test-time training (no RoPE scaling)"
-echo "============================================================"
-
-run_experiment "eval_ttt_only" \
-    "QAT mixed + TTT_ENABLED=1 — isolate TTT effect at train_seq_len" \
-    "none" \
-    1 \
-    QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
-    TTT_ENABLED=1 TTT_LR=1e-5 \
     || true
 
 # =============================================================================
@@ -334,13 +332,13 @@ check_experiment() {
 }
 
 check_experiment "Architecture stable (int8 export)" "no_qat_int8"
-check_experiment "Mixed-precision export (int4+int8)" "no_qat_mixed"
-check_experiment "QAT closes int4 gap" "qat_mixed"
-check_experiment "RoPE scaling" "eval_rope_only"
-check_experiment "Test-time training" "eval_ttt_only"
+check_experiment "int6+zlib export" "no_qat_int6_zlib"
+check_experiment "int6+LZMA export (submission core)" "int6_lzma"
+check_experiment "N-gram eval on int6+LZMA" "int6_lzma_ngram"
+check_experiment "RoPE scaling on int6+LZMA" "int6_lzma_rope"
 
-# Size check from best QAT experiment
-compressed_bytes=$(echo "$results_content" | grep "qat_mixed" | grep -oP 'compressed=\K\d+' || echo "0")
+# Size check from submission core experiment
+compressed_bytes=$(echo "$results_content" | grep "int6_lzma " | grep -oP 'compressed=\K\d+' || echo "0")
 if [ -f "train_gpt.py" ] && [ "$compressed_bytes" -gt 0 ]; then
     code_bytes=$(wc -c < train_gpt.py)
     total=$((compressed_bytes + code_bytes))
@@ -358,13 +356,13 @@ fi
 echo ""
 echo "NEXT STEPS:"
 echo "  If no_qat_int8 PASS + gap < 0.01:"
-echo "    Architecture is solid. Proceed to mixed-precision export."
-echo "  If no_qat_mixed PASS + gap < 0.05:"
-echo "    Mixed export works. Add QAT to close gap further."
-echo "  If qat_mixed PASS + gap < 0.03:"
-echo "    Ready for eval tricks. Check rope/ttt for improvement."
-echo "  If qat_mixed FAIL (gap too large):"
-echo "    Debug export mismatch. Try EXPORT_BITS=8 with bigger model."
+echo "    Architecture is solid. Proceed to int6 export."
+echo "  If int6_lzma PASS + gap < 0.02:"
+echo "    Export pipeline works. Check n-gram for BPB improvement."
+echo "  If int6_lzma_ngram improves over int6_lzma:"
+echo "    Full submission config validated. Ready for 8xH100."
+echo "  If int6_lzma FAIL (gap too large):"
+echo "    Fall back to int8 export or investigate quantization."
 
 echo ""
 echo "Full results: $RESULTS_FILE"

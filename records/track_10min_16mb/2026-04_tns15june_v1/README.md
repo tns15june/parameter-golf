@@ -1,22 +1,23 @@
-## Depth Recurrence + int4 QAT + Eval-Time Optimization
+## Baseline 9L/512d + int6 LZMA + N-gram Eval
 
 ### Approach
 
-Three orthogonal techniques stacked together:
+Baseline architecture with optimized export and eval-time scoring:
 
-1. **Depth Recurrence**: 3 unique transformer blocks shared across 4 recurrences = 12 effective layers. Per-effective-layer control scalars (attn_scales, mlp_scales, resid_mixes, q_gains) allow each recurrence to behave differently while sharing heavy weights (Q, K, V, projection, MLP matrices). This frees parameter budget for a wider model.
+1. **Baseline architecture (9L/512d)**: 9 transformer layers at dimension 512, 8 attention heads with 4 KV heads (GQA), 2x MLP expansion, tied embeddings. No depth recurrence — maximizes training steps within the 10-minute wallclock budget.
 
-2. **int4 Quantization-Aware Training (QAT)**: Fake quantization injected into CastedLinear forward passes after 25% of training. STE (Straight-Through Estimator) lets gradients flow through. int4 export stores values in int8 tensors with restricted [-8,7] range — zlib compresses ~2x better, doubling effective parameter budget within the 16MB limit.
+2. **int6 + LZMA export**: 6-bit quantization for block weights (per-row percentile clipping), 8-bit for embeddings. LZMA compression (preset 9 extreme) achieves ~30% smaller artifacts than zlib, keeping total size well under 16MB.
 
-3. **Eval-Time Optimization**: NTK-aware RoPE scaling for 4x longer eval context (4096 vs 1024 training). Optional test-time training adapts embeddings and control scalars on validation data.
+3. **N-gram eval cache**: Online n-gram statistics (up to order 5) blended with transformer predictions at eval time. Zero artifact bytes — the cache is built from validation data during evaluation.
 
 ### Configuration
 
 ```bash
-NUM_UNIQUE_LAYERS=3 NUM_RECURRENCES=4 MODEL_DIM=768 NUM_HEADS=12 NUM_KV_HEADS=6 \
+NUM_UNIQUE_LAYERS=9 NUM_RECURRENCES=1 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 \
 MLP_MULT=2 VOCAB_SIZE=1024 TRAIN_SEQ_LEN=1024 TIE_EMBEDDINGS=1 \
-QAT_BITS=4 QAT_START_FRAC=0.25 EXPORT_BITS=4 EMBED_EXPORT_BITS=8 \
-EVAL_SEQ_LEN=4096 TTT_ENABLED=1 TTT_LR=1e-5 \
+QAT_BITS=0 EXPORT_BITS=6 EMBED_EXPORT_BITS=8 \
+EVAL_SEQ_LEN=1024 NGRAM_ENABLED=1 NGRAM_MAX_ORDER=5 NGRAM_ALPHA=0.2 \
+COMPRESS_METHOD=lzma \
 ROPE_BASE=10000 LOGIT_SOFTCAP=30.0 TRAIN_BATCH_TOKENS=524288 \
 MAX_WALLCLOCK_SECONDS=600 \
 torchrun --standalone --nproc_per_node=8 train_gpt.py
@@ -24,11 +25,11 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 
 ### Architecture
 
-- **Effective depth**: 12 layers (3 unique x 4 recurrences)
-- **Width**: 768 (vs baseline 512)
-- **Params**: ~13.2M total
-- **Compressed size**: ~7.9MB int4+zlib (well under 16MB)
-- **U-Net skips**: Applied across effective layer positions
+- **Depth**: 9 layers (no recurrence)
+- **Width**: 512
+- **Params**: ~4.6M total
+- **Export**: int6 blocks + int8 embeddings, LZMA compressed
+- **U-Net skips**: Applied across encoder/decoder layer halves
 
 ### Key Metrics
 
@@ -37,7 +38,7 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 - Pre-quant eval: `val_loss:___ val_bpb:___`
 - Post-quant roundtrip: `val_loss:___ val_bpb:___`
 - Train time: `___ms`
-- Serialized model int4+zlib: `___ bytes`
+- Serialized model: `___ bytes`
 - Code size: `___ bytes`
 - Total submission size: `___ bytes`
 

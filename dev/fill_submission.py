@@ -30,8 +30,8 @@ def main():
     val_loss = float(rt.group(1))
     val_bpb = float(rt.group(2))
 
-    # Parse sizes
-    sz = re.search(r"Total submission size int8\+zlib: (\d+) bytes", log_text)
+    # Parse sizes (handles both old "int8+zlib:" and new format)
+    sz = re.search(r"Total submission size.*?: (\d+) bytes", log_text)
     code_sz = re.search(r"Code size: (\d+) bytes", log_text)
 
     bytes_total = int(sz.group(1)) if sz else 0
@@ -40,11 +40,11 @@ def main():
     submission = {
         "author": "Tarkeshwar Narayan Sharma",
         "github_id": "tns15june",
-        "name": "Depth Recurrence + int4 QAT + Eval-Time Optimization",
+        "name": "Baseline 9L/512d + int6 LZMA + N-gram Eval",
         "blurb": (
-            "3 unique layers x 4 recurrences = 12 effective layers at dim=768 "
-            "with int4 QAT, NTK-aware RoPE eval context extension, and test-time training. "
-            f"Post-quant roundtrip BPB: {val_bpb:.4f}."
+            "9-layer dim=512 baseline architecture, no recurrence, no QAT. "
+            "int6 block weights + int8 embeddings with LZMA compression. "
+            f"N-gram eval cache. Post-quant roundtrip BPB: {val_bpb:.4f}."
         ),
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "val_loss": val_loss,

@@ -1,7 +1,7 @@
 #!/bin/bash
 # One-command RunPod launcher — survives SSH disconnects via nohup
 # Usage: bash dev/runpod_go.sh [final|wide|validate]
-#   final    — 8xH100 submission run with dim=768 (default)
+#   final    — 8xH100 submission run with dim=512 (default)
 #   wide     — 8xH100 submission run with dim=1024
 #   validate — 1xGPU validation of experiments 4+5 (RoPE + TTT)
 
@@ -31,7 +31,7 @@ echo "Dataset ready: $(ls data/datasets/fineweb10B_sp1024/fineweb_train_*.bin | 
 # Select config
 case "$MODE" in
     final)
-        echo "Running FINAL submission (dim=768, 8xH100)..."
+        echo "Running FINAL submission (dim=512, 8xH100)..."
         bash dev/run_final.sh
         ;;
     wide)
