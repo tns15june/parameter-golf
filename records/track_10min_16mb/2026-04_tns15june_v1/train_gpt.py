@@ -318,53 +318,56 @@ def eval_val_ttt(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    """Test-time training: adapt on val data chunk-by-chunk, scoring as we go.
-    Each rank independently adapts on its shard, then results are all-reduced."""
+    """Test-time training: adapt on val data chunk-by-chunk, scoring each chunk
+    BEFORE adapting on it (causal protocol: predict-then-update).
+    Runs on rank 0 only for GPU-count-independent reproducibility."""
     seq_len = args.eval_seq_len
-    # Select TTT params: embeddings + per-position control scalars
-    ttt_params = []
-    for name, p in base_model.named_parameters():
-        if "tok_emb" in name or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS):
-            ttt_params.append(p)
-            p.requires_grad_(True)
-        else:
-            p.requires_grad_(False)
-    ttt_opt = torch.optim.Adam(ttt_params, lr=args.ttt_lr)
     total_seqs = (val_tokens.numel() - 1) // seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    base_model.train()
-    for seq_idx in range(seq_start, seq_end):
-        start = seq_idx * seq_len
-        chunk = val_tokens[start : start + seq_len + 1].to(device=device, dtype=torch.int64)
-        x = chunk[:-1].unsqueeze(0)
-        y = chunk[1:].unsqueeze(0)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            loss = base_model(x, y)
-        with torch.no_grad():
-            n = float(y.numel())
-            val_loss_sum += loss.detach().to(torch.float64) * n
-            val_token_count += n
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            tb = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.int16)
-            val_byte_count += tb.to(torch.float64).sum()
-        loss.backward()
-        ttt_opt.step()
-        ttt_opt.zero_grad()
+    if rank == 0:
+        # Select TTT params: embeddings + per-position control scalars
+        ttt_params = []
+        for name, p in base_model.named_parameters():
+            if "tok_emb" in name or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS):
+                ttt_params.append(p)
+                p.requires_grad_(True)
+            else:
+                p.requires_grad_(False)
+        ttt_opt = torch.optim.Adam(ttt_params, lr=args.ttt_lr)
 
+        base_model.train()
+        for seq_idx in range(total_seqs):
+            start = seq_idx * seq_len
+            chunk = val_tokens[start : start + seq_len + 1].to(device=device, dtype=torch.int64)
+            x = chunk[:-1].unsqueeze(0)
+            y = chunk[1:].unsqueeze(0)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = base_model(x, y)
+            with torch.no_grad():
+                n = float(y.numel())
+                val_loss_sum += loss.detach().to(torch.float64) * n
+                val_token_count += n
+                prev_ids = x.reshape(-1)
+                tgt_ids = y.reshape(-1)
+                tb = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.int16)
+                val_byte_count += tb.to(torch.float64).sum()
+            loss.backward()
+            ttt_opt.step()
+            ttt_opt.zero_grad()
+
+        for p in base_model.parameters():
+            p.requires_grad_(True)
+
+    # Broadcast results from rank 0 to all ranks
     if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+        results = torch.stack([val_loss_sum, val_token_count, val_byte_count])
+        dist.broadcast(results, src=0)
+        val_loss_sum, val_token_count, val_byte_count = results[0], results[1], results[2]
 
-    for p in base_model.parameters():
-        p.requires_grad_(True)
     val_loss = val_loss_sum / val_token_count
     bpt = val_loss.item() / math.log(2.0)
     tpb = val_token_count.item() / val_byte_count.item()
@@ -382,14 +385,14 @@ def eval_val_ngram(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    """Evaluate with n-gram cache: blend model predictions with empirical n-gram counts."""
+    """Evaluate with n-gram cache: blend model predictions with empirical n-gram counts.
+    Runs on rank 0 only with a single global cache to ensure GPU-count-independent scores."""
     seq_len = args.eval_seq_len
     max_order = args.ngram_max_order
     alpha = args.ngram_alpha
 
+    # Run entirely on rank 0 for reproducibility — n-gram caches must be global.
     total_seqs = (val_tokens.numel() - 1) // seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
 
     # N-gram caches by order: {context_tuple: {next_token: count}}
     caches: list[dict] = [dict() for _ in range(max_order + 1)]
@@ -399,73 +402,70 @@ def eval_val_ngram(
     val_byte_count = 0.0
     ngram_hits = 0
 
-    tok = val_tokens.tolist()
-    blut = base_bytes_lut.cpu().tolist()
-    slut = has_leading_space_lut.cpu().tolist()
-    bout = is_boundary_token_lut.cpu().tolist()
-
-    model.eval()
-    with torch.inference_mode():
-        for seq_idx in range(seq_start, seq_end):
-            start = seq_idx * seq_len
-            x = val_tokens[start : start + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
-
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                logits = model(x)  # (1, seq_len, vocab)
-
-            tgt = val_tokens[start + 1 : start + seq_len + 1].to(device=device, dtype=torch.int64)
-            lp_all = F.log_softmax(logits[0].float(), dim=-1)
-            tgt_lps = lp_all.gather(1, tgt.unsqueeze(1)).squeeze(1).cpu().tolist()
-
-            for pos in range(seq_len):
-                tp = start + pos
-                target = tok[tp + 1]
-                model_lp = tgt_lps[pos]
-
-                # N-gram backoff lookup: find highest order with target in cache
-                ngram_p = 0.0
-                for order in range(max_order, 1, -1):
-                    if tp + 1 >= order:
-                        ctx = tuple(tok[tp + 2 - order : tp + 1])
-                        c = caches[order].get(ctx)
-                        if c is not None and target in c:
-                            ngram_p = c[target] / sum(c.values())
-                            break
-
-                if ngram_p > 0:
-                    ngram_hits += 1
-                    blended = (1.0 - alpha) * math.exp(model_lp) + alpha * ngram_p
-                    val_loss_sum -= math.log(max(blended, 1e-30))
-                else:
-                    val_loss_sum -= model_lp
-
-                val_token_count += 1
-                tb = blut[target]
-                if slut[target] and not bout[tok[tp]]:
-                    tb += 1
-                val_byte_count += tb
-
-                # Update caches
-                for order in range(2, max_order + 1):
-                    if tp + 1 >= order:
-                        ctx = tuple(tok[tp + 2 - order : tp + 1])
-                        cache = caches[order]
-                        if ctx not in cache:
-                            cache[ctx] = {}
-                        cache[ctx][target] = cache[ctx].get(target, 0) + 1
-
-    if dist.is_available() and dist.is_initialized():
-        ts = [torch.tensor(v, device=device, dtype=torch.float64) for v in (val_loss_sum, val_token_count, val_byte_count)]
-        for t in ts:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        val_loss_sum, val_token_count, val_byte_count = (t.item() for t in ts)
-        hits_t = torch.tensor(ngram_hits, device=device, dtype=torch.float64)
-        dist.all_reduce(hits_t, op=dist.ReduceOp.SUM)
-        ngram_hits = int(hits_t.item())
-
     if rank == 0:
+        tok = val_tokens.tolist()
+        blut = base_bytes_lut.cpu().tolist()
+        slut = has_leading_space_lut.cpu().tolist()
+        bout = is_boundary_token_lut.cpu().tolist()
+
+        model.eval()
+        with torch.inference_mode():
+            for seq_idx in range(total_seqs):
+                start = seq_idx * seq_len
+                x = val_tokens[start : start + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
+
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    logits = model(x)  # (1, seq_len, vocab)
+
+                tgt = val_tokens[start + 1 : start + seq_len + 1].to(device=device, dtype=torch.int64)
+                lp_all = F.log_softmax(logits[0].float(), dim=-1)
+                tgt_lps = lp_all.gather(1, tgt.unsqueeze(1)).squeeze(1).cpu().tolist()
+
+                for pos in range(seq_len):
+                    tp = start + pos
+                    target = tok[tp + 1]
+                    model_lp = tgt_lps[pos]
+
+                    # N-gram backoff lookup: find highest order with target in cache
+                    ngram_p = 0.0
+                    for order in range(max_order, 1, -1):
+                        if tp + 1 >= order:
+                            ctx = tuple(tok[tp + 2 - order : tp + 1])
+                            c = caches[order].get(ctx)
+                            if c is not None and target in c:
+                                ngram_p = c[target] / sum(c.values())
+                                break
+
+                    if ngram_p > 0:
+                        ngram_hits += 1
+                        blended = (1.0 - alpha) * math.exp(model_lp) + alpha * ngram_p
+                        val_loss_sum -= math.log(max(blended, 1e-30))
+                    else:
+                        val_loss_sum -= model_lp
+
+                    val_token_count += 1
+                    tb = blut[target]
+                    if slut[target] and not bout[tok[tp]]:
+                        tb += 1
+                    val_byte_count += tb
+
+                    # Update caches
+                    for order in range(2, max_order + 1):
+                        if tp + 1 >= order:
+                            ctx = tuple(tok[tp + 2 - order : tp + 1])
+                            cache = caches[order]
+                            if ctx not in cache:
+                                cache[ctx] = {}
+                            cache[ctx][target] = cache[ctx].get(target, 0) + 1
+
         hit_rate = ngram_hits / max(val_token_count, 1)
         print(f"ngram_hit_rate:{hit_rate:.4f} hits:{ngram_hits} total:{int(val_token_count)}")
+
+    # Broadcast results from rank 0 to all ranks
+    if dist.is_available() and dist.is_initialized():
+        results = torch.tensor([val_loss_sum, val_token_count, val_byte_count], device=device, dtype=torch.float64)
+        dist.broadcast(results, src=0)
+        val_loss_sum, val_token_count, val_byte_count = results[0].item(), results[1].item(), results[2].item()
 
     val_loss = val_loss_sum / val_token_count
     bpt = val_loss / math.log(2.0)
@@ -1350,9 +1350,9 @@ def main() -> None:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model: {model_bytes} bytes")
+        log0(f"Serialized model raw: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        log0(f"Total raw size (uncompressed): {model_bytes + code_bytes} bytes")
 
     embed_bits = args.embed_export_bits if args.embed_export_bits != args.export_bits else None
     quant_obj, quant_stats = quantize_state_dict_int8(
@@ -1412,17 +1412,13 @@ def main() -> None:
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     if args.ngram_enabled:
-        log0(f"Running n-gram eval (max_order={args.ngram_max_order}, alpha={args.ngram_alpha})...")
-        if world_size > 1:
-            log0(f"WARNING: n-gram caches are per-rank (not shared). BPB with {world_size} GPUs may differ from single-GPU eval.")
+        log0(f"Running n-gram eval on rank 0 (max_order={args.ngram_max_order}, alpha={args.ngram_alpha})...")
         q_val_loss, q_val_bpb = eval_val_ngram(
             args, base_model, rank, world_size, device, val_tokens,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
     elif args.ttt_enabled:
-        log0("Running test-time training eval...")
-        if world_size > 1:
-            log0(f"WARNING: TTT adapts independently per rank. BPB with {world_size} GPUs may differ from single-GPU eval.")
+        log0("Running test-time training eval on rank 0...")
         q_val_loss, q_val_bpb = eval_val_ttt(
             args, base_model, rank, world_size, device, val_tokens,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
