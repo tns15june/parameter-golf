@@ -1,22 +1,24 @@
-## Baseline 9L/512d + int6 LZMA + N-gram Eval
+## 10L/512d LeakyReLU² + int6 QAT + EMA + Sliding Window
 
 ### Approach
 
-Baseline architecture with optimized export and eval-time scoring:
+Competitive architecture with multiple training and eval-time optimizations:
 
-1. **Baseline architecture (9L/512d)**: 9 transformer layers at dimension 512, 8 attention heads with 4 KV heads (GQA), 2x MLP expansion, tied embeddings. No depth recurrence — maximizes training steps within the 10-minute wallclock budget.
+1. **10-layer 3x MLP architecture**: 10 transformer layers at dimension 512, 8 attention heads with 4 KV heads (GQA), 3x MLP expansion with LeakyReLU² activation, tied embeddings. ~24M params.
 
-2. **int6 + LZMA export**: 6-bit quantization for block weights (per-row percentile clipping), 8-bit for embeddings. LZMA compression (preset 9 extreme) achieves ~30% smaller artifacts than zlib, keeping total size well under 16MB.
+2. **Int6 QAT + LZMA export**: Quantization-aware training (6-bit, starting at 15% of training) minimizes the export gap. LZMA compression achieves excellent ratio for int6 values.
 
-3. **N-gram eval cache**: Online n-gram statistics (up to order 5) blended with transformer predictions at eval time. Zero artifact bytes — the cache is built from validation data during evaluation.
+3. **EMA (0.9995)**: Exponential moving average of weights during training produces smoother weights that generalize and compress better.
+
+4. **Sliding window eval**: Overlapping windows (stride=256, seq_len=2048) ensure every token has warm context, improving BPB over non-overlapping evaluation.
 
 ### Configuration
 
 ```bash
-NUM_UNIQUE_LAYERS=9 NUM_RECURRENCES=1 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 \
-MLP_MULT=2 VOCAB_SIZE=1024 TRAIN_SEQ_LEN=1024 TIE_EMBEDDINGS=1 \
-QAT_BITS=0 EXPORT_BITS=6 EMBED_EXPORT_BITS=8 \
-EVAL_SEQ_LEN=1024 NGRAM_ENABLED=1 NGRAM_MAX_ORDER=5 NGRAM_ALPHA=0.2 \
+NUM_UNIQUE_LAYERS=10 NUM_RECURRENCES=1 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 \
+MLP_MULT=3 VOCAB_SIZE=1024 TRAIN_SEQ_LEN=1024 TIE_EMBEDDINGS=1 \
+QAT_BITS=6 QAT_START_FRAC=0.15 EXPORT_BITS=6 EMBED_EXPORT_BITS=8 \
+EMA_DECAY=0.9995 EVAL_SEQ_LEN=2048 EVAL_STRIDE=256 \
 COMPRESS_METHOD=lzma \
 ROPE_BASE=10000 LOGIT_SOFTCAP=30.0 TRAIN_BATCH_TOKENS=524288 \
 MAX_WALLCLOCK_SECONDS=600 \
@@ -25,10 +27,11 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 
 ### Architecture
 
-- **Depth**: 9 layers (no recurrence)
+- **Depth**: 10 layers (no recurrence)
 - **Width**: 512
-- **Params**: ~4.6M total
-- **Export**: int6 blocks + int8 embeddings, LZMA compressed
+- **MLP**: 3x expansion with LeakyReLU² (slope=0.01)
+- **Params**: ~24M total
+- **Export**: int6 QAT blocks + int8 embeddings, LZMA compressed
 - **U-Net skips**: Applied across encoder/decoder layer halves
 
 ### Key Metrics

@@ -95,6 +95,9 @@ class Hyperparameters:
     ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", "5"))
     ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.2"))
 
+    ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))  # 0=disabled
+    eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))  # 0=non-overlapping
+
     # Compression: "zlib" (default) or "lzma" (better ratio, slower).
     compress_method = os.environ.get("COMPRESS_METHOD", "zlib")
     if compress_method not in ("zlib", "lzma"):
@@ -473,6 +476,36 @@ def eval_val_ngram(
     return float(val_loss), float(bpt * tpb)
 
 
+def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
+                     blut, slut, bout, seq_len, stride) -> tuple[float, float]:
+    nt = val_tokens.numel() - 1
+    wins = list(range(0, max(1, nt - seq_len + 1), stride))
+    nw, bsz = len(wins), max(1, args.val_batch_size // (world_size * seq_len))
+    w0, w1 = (nw * rank) // world_size, (nw * (rank + 1)) // world_size
+    ls, tc, bc = (torch.zeros((), device=device, dtype=torch.float64) for _ in range(3))
+    model.eval()
+    with torch.inference_mode():
+        for bi in range(w0, w1, bsz):
+            be = min(bi + bsz, w1)
+            x = torch.stack([val_tokens[wins[i]:wins[i]+seq_len] for i in range(bi, be)]).to(device, dtype=torch.int64)
+            y = torch.stack([val_tokens[wins[i]+1:wins[i]+seq_len+1] for i in range(bi, be)]).to(device, dtype=torch.int64)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(x)
+            pp = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="none").reshape_as(y)
+            for k, i in enumerate(range(bi, be)):
+                s = 0 if i == 0 else seq_len - stride
+                ls += pp[k, s:].sum().to(torch.float64)
+                tc += float(seq_len - s)
+                tb = blut[y[k, s:]].to(torch.int16) + (slut[y[k, s:]] & ~bout[x[k, s:]]).to(torch.int16)
+                bc += tb.to(torch.float64).sum()
+    if dist.is_available() and dist.is_initialized():
+        for t in [ls, tc, bc]:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    vl = (ls / tc).item()
+    model.train()
+    return vl, (vl / math.log(2.0)) * (tc.item() / bc.item())
+
+
 # -----------------------------
 # POST-TRAINING QUANTIZATION
 # -----------------------------
@@ -839,7 +872,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), negative_slope=0.01)
         return self.proj(x.square())
 
 
@@ -1152,6 +1185,8 @@ def main() -> None:
         log0(f"qat: bits={args.qat_bits} start_frac={args.qat_start_frac} export_bits={args.export_bits} embed_export_bits={args.embed_export_bits}")
     if args.eval_seq_len != args.train_seq_len:
         log0(f"eval: seq_len={args.eval_seq_len} rope_scale={args.eval_rope_scale} ttt={args.ttt_enabled}")
+    if args.ema_decay > 0 or args.eval_stride > 0:
+        log0(f"ema:{args.ema_decay} eval_stride:{args.eval_stride}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
@@ -1228,6 +1263,8 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    ema_state = {n: p.data.clone() for n, p in base_model.named_parameters()} if args.ema_decay > 0 else None
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1313,6 +1350,10 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        if ema_state is not None:
+            with torch.no_grad():
+                for n, p in base_model.named_parameters():
+                    ema_state[n].mul_(args.ema_decay).add_(p.data, alpha=1 - args.ema_decay)
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
@@ -1340,11 +1381,14 @@ def main() -> None:
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
 
-    # -----------------------------
-    # SERIALIZATION + ROUNDTRIP VALIDATION
-    # -----------------------------
-    # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
-    # the compressed int8+zlib artifact and validate the round-tripped weights.
+    if ema_state is not None:  # Load EMA weights for export
+        log0("Loading EMA weights for export")
+        with torch.no_grad():
+            for n, p in base_model.named_parameters():
+                p.data.copy_(ema_state[n])
+        del ema_state
+
+    # SERIALIZATION + ROUNDTRIP VALIDATION: produce compressed artifact and validate.
 
     if master_process:
         torch.save(base_model.state_dict(), "final_model.pt")
@@ -1422,6 +1466,13 @@ def main() -> None:
         q_val_loss, q_val_bpb = eval_val_ttt(
             args, base_model, rank, world_size, device, val_tokens,
             base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+    elif 0 < args.eval_stride < args.eval_seq_len:
+        log0(f"Running sliding window eval (stride={args.eval_stride}, seq_len={args.eval_seq_len})...")
+        q_val_loss, q_val_bpb = eval_val_sliding(
+            args, base_model, rank, world_size, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            args.eval_seq_len, args.eval_stride,
         )
     else:
         # Use uncompiled base_model for eval when seq_len differs from training
