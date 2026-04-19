@@ -46,10 +46,15 @@ SDCLIP_K="${SDCLIP_K:-2.5}" \
 EMA_DECAY="${EMA_DECAY:-0.9995}" \
 EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-1024}" \
 EVAL_STRIDE="${EVAL_STRIDE:-256}" \
-TTT_ENABLED="${TTT_ENABLED:-1}" \
+# TTT disabled for the first 8xH100 run: current implementation sliding-windows
+# + SGDs through all ~15k chunks of the full 60M-token val set. Even distributed
+# across 8 ranks it risks the 10-min eval budget. Enable for a second run once
+# we can cap safely via TTT_MAX_CHUNKS while still scoring all tokens.
+TTT_ENABLED="${TTT_ENABLED:-0}" \
 TTT_LR="${TTT_LR:-1e-5}" \
 TTT_CHUNK_TOKENS="${TTT_CHUNK_TOKENS:-4096}" \
 TTT_EPOCHS="${TTT_EPOCHS:-3}" \
+TTT_MAX_CHUNKS="${TTT_MAX_CHUNKS:-0}" \
 COMPRESS_METHOD="${COMPRESS_METHOD:-lzma}" \
 \
 TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-524288}" \
