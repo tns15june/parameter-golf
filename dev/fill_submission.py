@@ -40,17 +40,19 @@ def main():
     # Pick name + blurb by run config (detected from log lines).
     is_sp8192 = bool(re.search(r"vocab_size:8192", log_text))
     is_full_frontier = is_sp8192 and bool(re.search(r"muon_row_norm:True", log_text)) and bool(re.search(r"parallel_later_residuals:True", log_text))
+    has_ttt_adapt = bool(re.search(r"ttt_adapt:True", log_text))
     is_sp1024_frontier = bool(re.search(r"depth_recurrence:.*targeted:True", log_text)) and not is_sp8192
     if is_full_frontier:
-        name = "SP8192 Frontier Full: 11L/4xMLP + TargetedRec + ParallelLaterRes + PartialRoPE + LyrNorm + MuonEq-R + GPTQ+SDClip + Brotli + LegalTTT + TTT-Adaptable"
+        ttt_name = " + TTT-Adaptable" if has_ttt_adapt else ""
+        ttt_blurb = (" + first-order TTT-adaptable training (control-surface adaptation during late training)" if has_ttt_adapt else "")
+        name = f"SP8192 Frontier: 11L/4xMLP + TargetedRec + ParallelLaterRes + PartialRoPE + LyrNorm + MuonEq-R + GPTQ+SDClip + Brotli + LegalTTT{ttt_name}"
         blurb = (
             "11-layer dim=512 x MLP4x on SP8192. Targeted middle recurrence "
             "(layers 4..7 x 3, 19 effective). Parallel residuals from later layers "
             "(softmax mix). Partial RoPE 25%. Layerwise RMSNorm scale. QK gain 5.25. "
             "MuonEq-R (row-normalized Muon) + WD 0.09. EMA 0.9965. int6 GPTQ with "
-            "SDClip (k=2.5), int8 embeddings. Byte-shuffle + Brotli-11 compression. "
-            "Legal score-first sliding TTT + first-order TTT-adaptable training "
-            "(control-surface adaptation during late training). "
+            "SDClip (k=2.5), int8 amax embeddings. Byte-shuffle + Brotli-11 compression. "
+            f"Legal score-first sliding TTT{ttt_blurb}. "
             f"Post-quant roundtrip BPB: {val_bpb:.4f}."
         )
     elif is_sp1024_frontier:
