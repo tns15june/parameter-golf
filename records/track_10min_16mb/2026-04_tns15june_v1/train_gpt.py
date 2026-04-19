@@ -88,7 +88,6 @@ class Hyperparameters:
 
     # Eval-time optimization.
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
-    eval_rope_scale = float(os.environ.get("EVAL_ROPE_SCALE", "0.0"))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", "1e-5"))
 
@@ -310,73 +309,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-
-def eval_val_ttt(
-    args: Hyperparameters,
-    base_model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
-    """Test-time training: adapt on val data chunk-by-chunk, scoring each chunk
-    BEFORE adapting on it (causal protocol: predict-then-update).
-    Runs on rank 0 only for GPU-count-independent reproducibility."""
-    seq_len = args.eval_seq_len
-    total_seqs = (val_tokens.numel() - 1) // seq_len
-    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
-    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
-    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    if rank == 0:
-        # Select TTT params: embeddings + per-position control scalars
-        ttt_params = []
-        for name, p in base_model.named_parameters():
-            if "tok_emb" in name or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS):
-                ttt_params.append(p)
-                p.requires_grad_(True)
-            else:
-                p.requires_grad_(False)
-        ttt_opt = torch.optim.Adam(ttt_params, lr=args.ttt_lr)
-
-        base_model.train()
-        for seq_idx in range(total_seqs):
-            start = seq_idx * seq_len
-            chunk = val_tokens[start : start + seq_len + 1].to(device=device, dtype=torch.int64)
-            x = chunk[:-1].unsqueeze(0)
-            y = chunk[1:].unsqueeze(0)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                loss = base_model(x, y)
-            with torch.no_grad():
-                n = float(y.numel())
-                val_loss_sum += loss.detach().to(torch.float64) * n
-                val_token_count += n
-                prev_ids = x.reshape(-1)
-                tgt_ids = y.reshape(-1)
-                tb = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-                tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.int16)
-                val_byte_count += tb.to(torch.float64).sum()
-            loss.backward()
-            ttt_opt.step()
-            ttt_opt.zero_grad()
-
-        for p in base_model.parameters():
-            p.requires_grad_(True)
-
-    # Broadcast results from rank 0 to all ranks
-    if dist.is_available() and dist.is_initialized():
-        results = torch.stack([val_loss_sum, val_token_count, val_byte_count])
-        dist.broadcast(results, src=0)
-        val_loss_sum, val_token_count, val_byte_count = results[0], results[1], results[2]
-
-    val_loss = val_loss_sum / val_token_count
-    bpt = val_loss.item() / math.log(2.0)
-    tpb = val_token_count.item() / val_byte_count.item()
-    return float(val_loss.item()), float(bpt * tpb)
 
 
 def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
@@ -1448,26 +1380,17 @@ def main() -> None:
         if isinstance(m, CastedLinear):
             m._qat_bits = 0
 
-    # Linear RoPE base scaling for longer eval context
+    # NOTE: linear RoPE base scaling was removed. Observed 0.57 BPB export gap
+    # when evaluating at seq_len > train_seq_len without position-interp training.
+    # Default eval_seq_len to train_seq_len; use eval_stride for warm context instead.
     if args.eval_seq_len > args.train_seq_len:
-        rope_scale = args.eval_rope_scale if args.eval_rope_scale > 0 else (args.eval_seq_len / args.train_seq_len)
-        for block in base_model.blocks:
-            r = block.attn.rotary
-            dim = r.inv_freq.numel() * 2
-            new_base = args.rope_base * rope_scale
-            r.inv_freq = (1.0 / (new_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))).to(device)
-            r._seq_len_cached = 0
-        log0(f"RoPE scaled: base {args.rope_base} -> {args.rope_base * rope_scale:.0f} (scale={rope_scale:.2f})")
+        raise RuntimeError(f"EVAL_SEQ_LEN={args.eval_seq_len} > TRAIN_SEQ_LEN={args.train_seq_len} requires position-interp training (unavailable on this branch)")
 
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     if args.ttt_enabled:
-        log0("Running test-time training eval on rank 0...")
-        q_val_loss, q_val_bpb = eval_val_ttt(
-            args, base_model, rank, world_size, device, val_tokens,
-            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
-    elif 0 < args.eval_stride < args.eval_seq_len:
+        raise RuntimeError("TTT_ENABLED=1 requires legal score-first sliding TTT (not yet ported on this branch)")
+    if 0 < args.eval_stride < args.eval_seq_len:
         log0(f"Running sliding window eval (stride={args.eval_stride}, seq_len={args.eval_seq_len})...")
         q_val_loss, q_val_bpb = eval_val_sliding(
             args, base_model, rank, world_size, device, val_tokens,
