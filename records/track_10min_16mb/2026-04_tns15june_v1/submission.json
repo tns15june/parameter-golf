@@ -1,8 +1,8 @@
 {
   "author": "Tarkeshwar Narayan Sharma",
   "github_id": "tns15june",
-  "name": "10L/512d LeakyReLU\u00b2 + int6 QAT + EMA + Sliding Window",
-  "blurb": "10-layer dim=512 with 2x MLP and LeakyReLU\u00b2 activation. int6 QAT (start at 15%) + int8 embeddings, LZMA-compressed. EMA(0.9995) of weights for export. Sliding-window eval (seq_len=1024, stride=256). SP-1024 tokenizer, 10-min 8xH100 training.",
+  "name": "SP8192 Frontier: 11L/4xMLP + TargetedRec + ParallelLaterRes + PartialRoPE + LyrNorm + MuonEq-R + GPTQ+SDClip + Brotli + LegalTTT",
+  "blurb": "11-layer dim=512 x MLP4x on SP8192 (locally retokenized). Targeted middle recurrence (layers 4..7 x 3, 19 effective). Parallel residuals from later layers (softmax mix). Partial RoPE 25%. Layerwise RMSNorm scale. QK gain 5.25. MuonEq-R + WD 0.09. EMA 0.9965. int6 GPTQ with SDClip (k=2.5) on matrices, int8 amax on embeddings. Byte-shuffle + Brotli-11 compression. Legal score-first sliding TTT (scope-once-per-token). Values in submission.json are auto-filled post-run by dev/fill_submission.py.",
   "date": "FILL_AFTER_RUN",
   "val_loss": 0.0,
   "val_bpb": 0.0,

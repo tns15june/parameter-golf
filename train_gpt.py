@@ -503,11 +503,11 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8,
         # Block weights: use main bits with amax matching fake_quantize.
         is_embed = "tok_emb" in name
         t_bits = embed_bits if (embed_bits is not None and is_embed) else bits
+        # Embeddings bypass SDClip on the fallback path (k*std too tight for embedding rows).
         if hessians is not None and t.ndim == 2 and name in hessians:
-            q, s = gptq_quantize_layer(t, hessians[name].cpu(), bits=t_bits, damp_percent=gptq_damp,
-                                       use_sdclip=use_sdclip, sdclip_k=sdclip_k)
+            q, s = gptq_quantize_layer(t, hessians[name].cpu(), bits=t_bits, damp_percent=gptq_damp, use_sdclip=use_sdclip, sdclip_k=sdclip_k)
         else:
-            q, s = quantize_float_tensor(t, bits=t_bits, use_sdclip=use_sdclip, sdclip_k=sdclip_k)
+            q, s = quantize_float_tensor(t, bits=t_bits, use_sdclip=(use_sdclip and not is_embed), sdclip_k=sdclip_k)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -1163,7 +1163,7 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps} seed:{args.seed}")
+    log0(f"model_params:{n_params} world_size:{world_size} grad_accum_steps:{grad_accum_steps} seed:{args.seed} vocab_size:{args.vocab_size}")
     log0(f"depth_recurrence: unique_layers:{args.num_unique_layers} recurrences:{args.num_recurrences} effective_layers:{base_model.num_effective_layers} targeted:{args.targeted_recurrence} schedule:{base_model.visit_schedule}")
     log0(f"arch: rope_fraction:{args.rope_fraction} layerwise_norm_scale:{args.layerwise_norm_scale} parallel_residuals:{args.parallel_residuals} parallel_later_residuals:{args.parallel_later_residuals} qk_gain_init:{args.qk_gain_init}")
     log0(f"optim: matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} embed_lr:{token_lr} muon_wd:{args.muon_weight_decay} muon_row_norm:{args.muon_row_norm} ema:{args.ema_decay}")
@@ -1281,7 +1281,7 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        # TTT-adaptable training: first-order inner adaptation then outer backprop.
+        # TTT-adaptable training: first-order inner adaptation, outer backprop, manual all-reduce.
         if args.ttt_adapt_enabled and args.ttt_adapt_every > 0 and last_xy is not None \
            and wc_frac >= args.ttt_adapt_start_frac and step % args.ttt_adapt_every == 0:
             x_f, y_f = last_xy
@@ -1290,6 +1290,8 @@ def main() -> None:
             x_out, y_out = x_f[:, h:].contiguous(), y_f[:, h:].contiguous()
             ctrl_attrs = [a for a in ("attn_scales", "mlp_scales", "resid_mixes", "q_gains", "skip_weights", "late_mix") if hasattr(base_model, a)]
             ctrl_params = [getattr(base_model, a) for a in ctrl_attrs]
+            # Snapshot all param grads so we can all-reduce ONLY the aux-loss delta below.
+            pre_grads = {id(p): (p.grad.clone() if p.grad is not None else None) for p in base_model.parameters()}
             with torch.enable_grad():
                 inner_loss = base_model(x_in, y_in)
                 g_ctrl = torch.autograd.grad(inner_loss, ctrl_params, create_graph=False, retain_graph=False, allow_unused=True)
@@ -1306,6 +1308,14 @@ def main() -> None:
                     if a in base_model.__dict__:
                         del base_model.__dict__[a]
                     base_model._parameters[a] = originals[a]
+            # All-reduce the aux-loss delta so ranks stay in sync (DDP hooks didn't fire).
+            if dist.is_available() and dist.is_initialized():
+                for p in base_model.parameters():
+                    if p.grad is not None:
+                        prev = pre_grads.get(id(p))
+                        delta = p.grad - prev if prev is not None else p.grad.clone()
+                        dist.all_reduce(delta, op=dist.ReduceOp.AVG)
+                        p.grad = (prev + delta) if prev is not None else delta
 
         # Control-surface regularizer: amplify grads on scalar control params.
         if args.ctrl_surface_lambda > 0:

@@ -38,7 +38,7 @@ def main():
     bytes_code = int(code_sz.group(1)) if code_sz else 0
 
     # Pick name + blurb by run config (detected from log lines).
-    is_sp8192 = bool(re.search(r"VOCAB_SIZE.*8192|vocab_size.*8192", log_text))
+    is_sp8192 = bool(re.search(r"vocab_size:8192", log_text))
     is_full_frontier = is_sp8192 and bool(re.search(r"muon_row_norm:True", log_text)) and bool(re.search(r"parallel_later_residuals:True", log_text))
     is_sp1024_frontier = bool(re.search(r"depth_recurrence:.*targeted:True", log_text)) and not is_sp8192
     if is_full_frontier:

@@ -41,20 +41,29 @@ fi
 
 pip install -q -r requirements.txt
 
-# Download dataset if needed (variant chosen by mode above)
+# Download dataset if needed (variant chosen by mode above).
 TRAIN_SHARD_COUNT=$(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l)
-# For smoke mode a small subset is enough; for real runs we need the full 80 shards.
 MIN_SHARDS=$([ "$MODE" = "smoke" ] && echo 4 || echo 80)
 if [ "$TRAIN_SHARD_COUNT" -lt "$MIN_SHARDS" ]; then
-    echo "Downloading $VARIANT dataset (have $TRAIN_SHARD_COUNT shards, need $MIN_SHARDS)..."
-    # SP8192 requires --also-download-docs to trigger local tokenizer training + retokenization
-    # (manifest only publishes SP1024 pre-tokenized; SP8192 is produced locally from docs_selected.jsonl).
-    EXTRA_ARG=""
-    [ "$VARIANT" = "sp8192" ] && EXTRA_ARG="--also-download-docs"
-    if [ "$MODE" = "smoke" ]; then
-        python3 data/cached_challenge_fineweb.py --variant "$VARIANT" --train-shards 4 $EXTRA_ARG
+    if [ "$VARIANT" = "sp8192" ]; then
+        # SP8192 is NOT published pre-tokenized. Produce it locally: download raw
+        # docs_selected.jsonl, train SP8192 BPE, retokenize all 15.37M docs.
+        # download_hf_docs_and_tokenize.py does all three steps given the
+        # sp_bpe_8192 entry in data/tokenizer_specs.json.
+        echo "Generating SP8192 data locally via download_hf_docs_and_tokenize.py..."
+        REUSE=""
+        [ -f data/tokenizers/fineweb_1024_bpe.model ] && REUSE="--reuse-sp-model 1024=data/tokenizers/fineweb_1024_bpe.model"
+        python3 data/download_hf_docs_and_tokenize.py \
+            --output-root data \
+            --tokenizer-config data/tokenizer_specs.json \
+            --skip-byte $REUSE
     else
-        python3 data/cached_challenge_fineweb.py --variant "$VARIANT" $EXTRA_ARG
+        echo "Downloading $VARIANT dataset (have $TRAIN_SHARD_COUNT shards, need $MIN_SHARDS)..."
+        if [ "$MODE" = "smoke" ]; then
+            python3 data/cached_challenge_fineweb.py --variant "$VARIANT" --train-shards 4
+        else
+            python3 data/cached_challenge_fineweb.py --variant "$VARIANT"
+        fi
     fi
 fi
 echo "Dataset ready: $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) train shards ($VARIANT)"
