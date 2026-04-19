@@ -505,7 +505,7 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8,
         t_bits = embed_bits if (embed_bits is not None and is_embed) else bits
         # Embeddings bypass SDClip on the fallback path (k*std too tight for embedding rows).
         if hessians is not None and t.ndim == 2 and name in hessians:
-            q, s = gptq_quantize_layer(t, hessians[name].cpu(), bits=t_bits, damp_percent=gptq_damp, use_sdclip=use_sdclip, sdclip_k=sdclip_k)
+            q, s = gptq_quantize_layer(t, hessians[name].cpu(), bits=t_bits, damp_percent=gptq_damp, use_sdclip=(use_sdclip and not is_embed), sdclip_k=sdclip_k)
         else:
             q, s = quantize_float_tensor(t, bits=t_bits, use_sdclip=(use_sdclip and not is_embed), sdclip_k=sdclip_k)
         if s.ndim > 0:
@@ -1310,12 +1310,14 @@ def main() -> None:
                         del base_model.__dict__[a]
                     base_model._parameters[a] = originals[a]
             # All-reduce the aux-loss delta so ranks stay in sync (DDP hooks didn't fire).
+            # Use SUM + explicit division: ReduceOp.AVG is silently unreliable on older NCCL builds.
             if dist.is_available() and dist.is_initialized():
                 for p in base_model.parameters():
                     if p.grad is not None:
                         prev = pre_grads.get(id(p))
                         delta = p.grad - prev if prev is not None else p.grad.clone()
-                        dist.all_reduce(delta, op=dist.ReduceOp.AVG)
+                        dist.all_reduce(delta, op=dist.ReduceOp.SUM)
+                        delta /= world_size
                         p.grad = (prev + delta) if prev is not None else delta
 
         # Control-surface regularizer: amplify grads on scalar control params.
