@@ -90,10 +90,10 @@ class Hyperparameters:
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", "1e-5"))
 
-    # N-gram eval cache.
-    ngram_enabled = bool(int(os.environ.get("NGRAM_ENABLED", "0")))
-    ngram_max_order = int(os.environ.get("NGRAM_MAX_ORDER", "5"))
-    ngram_alpha = float(os.environ.get("NGRAM_ALPHA", "0.2"))
+    # Self-Generated GPTQ quantization (Hessian-aware column rounding).
+    quant_method = os.environ.get("QUANT_METHOD", "amax")  # "amax" or "gptq"
+    gptq_calib_tokens = int(os.environ.get("GPTQ_CALIB_TOKENS", "16384"))
+    gptq_damp_percent = float(os.environ.get("GPTQ_DAMP_PERCENT", "0.01"))
 
     ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))  # 0=disabled
     eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))  # 0=non-overlapping
@@ -377,105 +377,6 @@ def eval_val_ttt(
     return float(val_loss.item()), float(bpt * tpb)
 
 
-def eval_val_ngram(
-    args: Hyperparameters,
-    model: nn.Module,
-    rank: int,
-    world_size: int,
-    device: torch.device,
-    val_tokens: Tensor,
-    base_bytes_lut: Tensor,
-    has_leading_space_lut: Tensor,
-    is_boundary_token_lut: Tensor,
-) -> tuple[float, float]:
-    """Evaluate with n-gram cache: blend model predictions with empirical n-gram counts.
-    Runs on rank 0 only with a single global cache to ensure GPU-count-independent scores."""
-    seq_len = args.eval_seq_len
-    max_order = args.ngram_max_order
-    alpha = args.ngram_alpha
-
-    # Run entirely on rank 0 for reproducibility — n-gram caches must be global.
-    total_seqs = (val_tokens.numel() - 1) // seq_len
-
-    # N-gram caches by order: {context_tuple: {next_token: count}}
-    caches: list[dict] = [dict() for _ in range(max_order + 1)]
-
-    val_loss_sum = 0.0
-    val_token_count = 0.0
-    val_byte_count = 0.0
-    ngram_hits = 0
-
-    if rank == 0:
-        tok = val_tokens.tolist()
-        blut = base_bytes_lut.cpu().tolist()
-        slut = has_leading_space_lut.cpu().tolist()
-        bout = is_boundary_token_lut.cpu().tolist()
-
-        model.eval()
-        with torch.inference_mode():
-            for seq_idx in range(total_seqs):
-                start = seq_idx * seq_len
-                x = val_tokens[start : start + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
-
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    logits = model(x)  # (1, seq_len, vocab)
-
-                tgt = val_tokens[start + 1 : start + seq_len + 1].to(device=device, dtype=torch.int64)
-                lp_all = F.log_softmax(logits[0].float(), dim=-1)
-                tgt_lps = lp_all.gather(1, tgt.unsqueeze(1)).squeeze(1).cpu().tolist()
-
-                for pos in range(seq_len):
-                    tp = start + pos
-                    target = tok[tp + 1]
-                    model_lp = tgt_lps[pos]
-
-                    # N-gram backoff lookup: find highest order with target in cache
-                    ngram_p = 0.0
-                    for order in range(max_order, 1, -1):
-                        if tp + 1 >= order:
-                            ctx = tuple(tok[tp + 2 - order : tp + 1])
-                            c = caches[order].get(ctx)
-                            if c is not None and target in c:
-                                ngram_p = c[target] / sum(c.values())
-                                break
-
-                    if ngram_p > 0:
-                        ngram_hits += 1
-                        blended = (1.0 - alpha) * math.exp(model_lp) + alpha * ngram_p
-                        val_loss_sum -= math.log(max(blended, 1e-30))
-                    else:
-                        val_loss_sum -= model_lp
-
-                    val_token_count += 1
-                    tb = blut[target]
-                    if slut[target] and not bout[tok[tp]]:
-                        tb += 1
-                    val_byte_count += tb
-
-                    # Update caches
-                    for order in range(2, max_order + 1):
-                        if tp + 1 >= order:
-                            ctx = tuple(tok[tp + 2 - order : tp + 1])
-                            cache = caches[order]
-                            if ctx not in cache:
-                                cache[ctx] = {}
-                            cache[ctx][target] = cache[ctx].get(target, 0) + 1
-
-        hit_rate = ngram_hits / max(val_token_count, 1)
-        print(f"ngram_hit_rate:{hit_rate:.4f} hits:{ngram_hits} total:{int(val_token_count)}")
-
-    # Broadcast results from rank 0 to all ranks
-    if dist.is_available() and dist.is_initialized():
-        results = torch.tensor([val_loss_sum, val_token_count, val_byte_count], device=device, dtype=torch.float64)
-        dist.broadcast(results, src=0)
-        val_loss_sum, val_token_count, val_byte_count = results[0].item(), results[1].item(), results[2].item()
-
-    val_loss = val_loss_sum / val_token_count
-    bpt = val_loss / math.log(2.0)
-    tpb = val_token_count / val_byte_count
-    return float(val_loss), float(bpt * tpb)
-
-
 def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
                      blut, slut, bout, seq_len, stride) -> tuple[float, float]:
     nt = val_tokens.numel() - 1
@@ -580,7 +481,9 @@ def quantize_float_tensor(t: Tensor, bits: int = 8, use_amax: bool = False) -> t
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val - 1, max_val).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_amax: bool = False, embed_bits: int | None = None):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_amax: bool = False,
+                             embed_bits: int | None = None, hessians: dict[str, Tensor] | None = None,
+                             gptq_damp: float = 0.01):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -622,8 +525,10 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_a
         # Block weights: use main bits with amax matching fake_quantize.
         is_embed = "tok_emb" in name
         t_bits = embed_bits if (embed_bits is not None and is_embed) else bits
-        t_amax = use_amax and not is_embed
-        q, s = quantize_float_tensor(t, bits=t_bits, use_amax=t_amax)
+        if hessians is not None and t.ndim == 2 and not is_embed and name in hessians:
+            q, s = gptq_quantize_layer(t, hessians[name].cpu(), bits=t_bits, damp_percent=gptq_damp)
+        else:
+            q, s = quantize_float_tensor(t, bits=t_bits, use_amax=(use_amax and not is_embed))
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -631,8 +536,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_a
         dtypes[name] = str(t.dtype).removeprefix("torch.")
         stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
 
+    fmt = f"int{bits}_{'gptq' if hessians is not None else 'clean'}_per_row_v1"
     obj: dict[str, object] = {
-        "__quant_format__": f"int{bits}_clean_per_row_v1",
+        "__quant_format__": fmt,
         "quantized": quantized,
         "scales": scales,
         "dtypes": dtypes,
@@ -668,8 +574,97 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
+def gptq_quantize_layer(W: Tensor, H: Tensor, bits: int, damp_percent: float = 0.01) -> tuple[Tensor, Tensor]:
+    # GPTQ (Frantar et al. 2022): per-row scale, column-wise rounding with Hessian-aware
+    # error redistribution. W is (out, in); H = X^T X is (in, in) from calibration.
+    W = W.clone().float()
+    n = W.size(1)
+    max_val = (2 ** (bits - 1)) - 1
+    H = H.clone().float()
+    dead = torch.diag(H) == 0
+    live_diag = torch.diag(H)[~dead]
+    damp = damp_percent * live_diag.mean().item() if live_diag.numel() else 1.0
+    H[torch.arange(n), torch.arange(n)] += damp
+    H[dead, dead] = 1.0
+    W[:, dead] = 0.0
+    # Compute upper-triangular Cholesky of H^-1.
+    L = torch.linalg.cholesky(H)
+    Hinv = torch.cholesky_inverse(L)
+    U = torch.linalg.cholesky(Hinv, upper=True)
+    # Per-row scale chosen once from initial W (before column updates).
+    scale = W.abs().amax(dim=1).clamp_min(1e-8) / max_val
+    Q = torch.zeros_like(W)
+    for c in range(n):
+        w_c = W[:, c].clone()
+        d = U[c, c].item()
+        q_c = torch.clamp(torch.round(w_c / scale), -max_val - 1, max_val)
+        Q[:, c] = q_c
+        err = (w_c - q_c * scale) / d
+        if c + 1 < n:
+            W[:, c + 1:] -= err.unsqueeze(1) * U[c, c + 1:].unsqueeze(0)
+    return Q.to(torch.int8).contiguous(), scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+
+
+class GPTQCalibrator:
+    # Forward-pre-hooks on every CastedLinear accumulate Hessian H = sum X^T X.
+    def __init__(self, base_model: nn.Module):
+        self.Hs: dict[str, Tensor] = {}
+        self.handles: list = []
+        for mod_name, mod in base_model.named_modules():
+            if isinstance(mod, CastedLinear):
+                key = mod_name + ".weight"
+                self.handles.append(mod.register_forward_pre_hook(self._mk_hook(key)))
+        # Cover the tied-embedding output projection path: F.linear(x, tok_emb.weight)
+        # is handled by fallback amax quantization (embedding is separately bit-widthed).
+
+    def _mk_hook(self, key: str):
+        def hook(_m, inputs):
+            x = inputs[0].detach().float().reshape(-1, inputs[0].size(-1))
+            h = x.T @ x
+            if key in self.Hs:
+                self.Hs[key] += h
+            else:
+                self.Hs[key] = h
+        return hook
+
+    def close(self):
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+
+
+def run_gptq_calibration(base_model: nn.Module, train_loader: "DistributedTokenLoader",
+                         args: Hyperparameters, grad_accum_steps: int, device: torch.device):
+    # Accumulate Hessians across ~gptq_calib_tokens of training data per rank, then all-reduce
+    # so every rank quantizes against the same global calibration. QAT is temporarily disabled
+    # because we calibrate against the real (non-fake-quantized) weights that will be exported.
+    saved_qat = {}
+    for m in base_model.modules():
+        if isinstance(m, CastedLinear):
+            saved_qat[id(m)] = m._qat_bits
+            m._qat_bits = 0
+    base_model.eval()
+    calib = GPTQCalibrator(base_model)
+    tokens_seen = 0
+    with torch.no_grad():
+        while tokens_seen < args.gptq_calib_tokens:
+            x, _ = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                base_model(x)
+            tokens_seen += x.numel()
+    calib.close()
+    if dist.is_available() and dist.is_initialized():
+        for key in sorted(calib.Hs.keys()):
+            dist.all_reduce(calib.Hs[key], op=dist.ReduceOp.SUM)
+    base_model.train()
+    for m in base_model.modules():
+        if isinstance(m, CastedLinear) and id(m) in saved_qat:
+            m._qat_bits = saved_qat[id(m)]
+    return calib.Hs
+
+
 # -----------------------------
-# DATA LOADING 
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -1399,10 +1394,19 @@ def main() -> None:
         log0(f"Total raw size (uncompressed): {model_bytes + code_bytes} bytes")
 
     embed_bits = args.embed_export_bits if args.embed_export_bits != args.export_bits else None
+    hessians = None
+    if args.quant_method == "gptq":
+        log0(f"gptq: calibrating on ~{args.gptq_calib_tokens} tokens (damp={args.gptq_damp_percent})")
+        t_cal = time.perf_counter()
+        hessians = run_gptq_calibration(base_model, train_loader, args, grad_accum_steps, device)
+        log0(f"gptq: calibration done layers={len(hessians)} time={1000*(time.perf_counter()-t_cal):.0f}ms")
     quant_obj, quant_stats = quantize_state_dict_int8(
         base_model.state_dict(), bits=args.export_bits,
-        use_amax=(args.qat_bits > 0), embed_bits=embed_bits,
+        use_amax=(args.qat_bits > 0 and hessians is None), embed_bits=embed_bits,
+        hessians=hessians, gptq_damp=args.gptq_damp_percent,
     )
+    if hessians is not None:
+        del hessians
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1455,13 +1459,7 @@ def main() -> None:
 
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
-    if args.ngram_enabled:
-        log0(f"Running n-gram eval on rank 0 (max_order={args.ngram_max_order}, alpha={args.ngram_alpha})...")
-        q_val_loss, q_val_bpb = eval_val_ngram(
-            args, base_model, rank, world_size, device, val_tokens,
-            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-        )
-    elif args.ttt_enabled:
+    if args.ttt_enabled:
         log0("Running test-time training eval on rank 0...")
         q_val_loss, q_val_bpb = eval_val_ttt(
             args, base_model, rank, world_size, device, val_tokens,
