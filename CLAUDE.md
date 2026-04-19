@@ -136,11 +136,17 @@ The `train_gpt.py` must compile and run independently within the records folder.
 
 ## Participant Info
 
-- Name: Tarkeshwar Narayan Sharma
-- GitHub: tns15june
+- Name: Tarkeshwar Narayan Sharma — Senior AI/ML Engineer, 9 years experience
+- Current role: Senior AI Engineer at Topsource Worldwide (Remote, India)
+- Email: tns15june@gmail.com / tarkeshwar3sep@gmail.com
+- GitHub: tns15june | LinkedIn: linkedin.com/in/tarkeshwar-narayan-sharma
+- Education: B.E. Electrical & Electronics, RGPV University (8.09/10, 2010-2014)
+- Notable: AWS GenAI Hackathon 2025 Top 10 Winner; ~30-40% inference cost reduction in production; mentored 200+ engineers
+- Skills: PyTorch, TensorFlow, Transformers, LLMs (GPT-4, Claude, LLaMA), RAG, LangChain, SageMaker, distributed training, model optimization
 - Fork: https://github.com/tns15june/parameter-golf
 - Branch: `submission-v1`
 - Submission folder: `records/track_10min_16mb/2026-04_tns15june_v1/`
+- Competition motivation: talent showcase + potential OpenAI interview opportunity (hiring cohort June 2026); strategy "win at any cost" with $100 RunPod credit
 
 ## Implementation Status
 
@@ -205,3 +211,22 @@ bash dev/run_final_gptq.sh [int6|wide]
 - **TTT with LoRA**: More expressive test-time training than current embed+scalar TTT
 - **Position interpolation training**: Would unlock EVAL_SEQ_LEN>TRAIN_SEQ_LEN path (currently breaks)
 - **Tokenizer optimization**: BPE 8192 vocab explored by some submissions
+
+## Key Learnings (carry across sessions)
+
+### RoPE scaling without position-interpolation training is catastrophic
+
+If a model is trained at TRAIN_SEQ_LEN=N and you evaluate at EVAL_SEQ_LEN=2N with linear RoPE base scaling (base *= 2), expect a catastrophic perplexity blow-up. **Observed in this project on 2026-04-19**: 0.57 BPB export_gap (pre=1.1919 at 1024 → post=1.7615 at 2048).
+
+**Why:** Linear base scaling shifts ALL position frequencies, including short-range ones the model learned. Without training-time position interpolation (YaRN, NTK-aware, or training at the longer seq_len from the start), attention heads relying on specific short-range frequencies get corrupted.
+
+**Rule:** Default to `EVAL_SEQ_LEN == TRAIN_SEQ_LEN` unless explicitly trained with position interpolation. For warm-context benefit at eval, use `EVAL_STRIDE < EVAL_SEQ_LEN` (sliding window at SAME seq_len) instead of extending seq_len. Only set `EVAL_SEQ_LEN > TRAIN_SEQ_LEN` after confirming the training recipe supports it.
+
+### RunPod operational notes
+
+- Template `y5cejece4j` is the team's working PyTorch CUDA setup
+- Container disk 30 GB, volume 75 GB at `/workspace` is sufficient
+- 1×H100 PCIe ~$2.49/hr (ablation work); 8×H100 SXM ~$25/hr (final runs)
+- First-time dataset download ~$4 on 8×H100 (10-15 min × $25/hr); one-time per volume
+- Single-command entry point: `bash dev/runpod_go.sh final` (installs deps, downloads data if missing, runs dev/run_final.sh)
+- GitHub push required before pod-side `git pull` — pod clones from remote, not local working tree
