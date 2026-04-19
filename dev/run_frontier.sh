@@ -5,10 +5,12 @@
 set -e
 cd /workspace/parameter-golf
 
-# SP8192 data + tokenizer
-DATA_PATH="${DATA_PATH:-data/datasets/fineweb10B_sp8192}" \
-TOKENIZER_PATH="${TOKENIZER_PATH:-data/tokenizers/fineweb_8192_bpe.model}" \
-VOCAB_SIZE="${VOCAB_SIZE:-8192}" \
+# SP1024 tokenizer/data (SP8192 is not published in the upstream manifest;
+# retokenizing from docs_selected.jsonl would add hours + $ that this branch can't afford).
+# All other frontier features are orthogonal to tokenizer choice.
+DATA_PATH="${DATA_PATH:-data/datasets/fineweb10B_sp1024}" \
+TOKENIZER_PATH="${TOKENIZER_PATH:-data/tokenizers/fineweb_1024_bpe.model}" \
+VOCAB_SIZE="${VOCAB_SIZE:-1024}" \
 \
 NUM_UNIQUE_LAYERS="${NUM_UNIQUE_LAYERS:-11}" \
 NUM_RECURRENCES="${NUM_RECURRENCES:-3}" \

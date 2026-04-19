@@ -11,12 +11,8 @@ set -e
 MODE="${1:-frontier}"
 NGPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 
-# Decide which dataset variant the selected mode needs.
-case "$MODE" in
-    frontier|smoke) VARIANT=sp8192 ;;
-    final|wide|validate) VARIANT=sp1024 ;;
-    *) VARIANT=sp1024 ;;
-esac
+# All modes use SP1024 (the only variant published in the upstream manifest).
+VARIANT=sp1024
 DATA_DIR="data/datasets/fineweb10B_${VARIANT}"
 
 echo "============================================================"

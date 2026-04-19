@@ -21,14 +21,15 @@ fi
 
 pip install -q -r requirements.txt
 
-# Ensure SP8192 data (small subset is fine for smoke)
-SP8192_DIR="data/datasets/fineweb10B_sp8192"
-if [ ! -d "$SP8192_DIR" ] || [ $(ls "$SP8192_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) -lt 1 ]; then
-    echo "Downloading SP8192 data (4 shards for smoke)..."
-    python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 4
+# Ensure SP1024 data (SP8192 would need local retokenization from docs_selected.jsonl;
+# not feasible on this branch's budget). 4 shards are enough for a smoke.
+DATA_DIR="data/datasets/fineweb10B_sp1024"
+if [ ! -d "$DATA_DIR" ] || [ $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) -lt 1 ]; then
+    echo "Downloading SP1024 data (4 shards for smoke)..."
+    python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 4
 fi
 
-SMOKE_COMMON="DATA_PATH=$SP8192_DIR TOKENIZER_PATH=data/tokenizers/fineweb_8192_bpe.model VOCAB_SIZE=8192 \
+SMOKE_COMMON="DATA_PATH=$DATA_DIR TOKENIZER_PATH=data/tokenizers/fineweb_1024_bpe.model VOCAB_SIZE=1024 \
 NUM_UNIQUE_LAYERS=4 NUM_RECURRENCES=1 MODEL_DIM=128 NUM_HEADS=4 NUM_KV_HEADS=2 MLP_MULT=2 \
 TRAIN_SEQ_LEN=512 TIE_EMBEDDINGS=1 ITERATIONS=500 TRAIN_BATCH_TOKENS=16384 \
 MAX_WALLCLOCK_SECONDS=300 VAL_LOSS_EVERY=100 TRAIN_LOG_EVERY=50 \
