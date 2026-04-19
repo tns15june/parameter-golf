@@ -97,6 +97,9 @@ class Hyperparameters:
     quant_method = os.environ.get("QUANT_METHOD", "amax")  # "amax" or "gptq"
     gptq_calib_tokens = int(os.environ.get("GPTQ_CALIB_TOKENS", "16384"))
     gptq_damp_percent = float(os.environ.get("GPTQ_DAMP_PERCENT", "0.01"))
+    gptq_embed = bool(int(os.environ.get("GPTQ_EMBED", "0")))  # also GPTQ-quantize the (tied) embedding
+    use_sdclip = bool(int(os.environ.get("USE_SDCLIP", "0")))  # std-based clipping for scale
+    sdclip_k = float(os.environ.get("SDCLIP_K", "2.5"))
 
     ema_decay = float(os.environ.get("EMA_DECAY", "0.0"))  # 0=disabled
     eval_stride = int(os.environ.get("EVAL_STRIDE", "0"))  # 0=non-overlapping
@@ -384,15 +387,20 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
 
-def quantize_float_tensor(t: Tensor, bits: int = 8, use_amax: bool = False) -> tuple[Tensor, Tensor]:
+def quantize_float_tensor(t: Tensor, bits: int = 8, use_amax: bool = False,
+                          use_sdclip: bool = False, sdclip_k: float = 2.5) -> tuple[Tensor, Tensor]:
     if bits < 2 or bits > 8:
         raise ValueError(f"Export bits must be in [2, 8], got {bits}. Values are stored in int8 containers.")
     max_val = (2 ** (bits - 1)) - 1  # 127 for int8, 31 for int6, 7 for int4
     t32 = t.float()
     if t32.ndim == 2:
-        if use_amax:
+        if use_sdclip:
+            # Std-based clipping: scale by k * std per row. Used by current frontier records.
+            row_std = t32.std(dim=1)
+            scale = (sdclip_k * row_std).clamp_min(1e-8) / max_val
+            q = torch.clamp(torch.round(t32 / scale[:, None]), -max_val - 1, max_val).to(torch.int8).contiguous()
+        elif use_amax:
             # Match fake_quantize exactly: per-row amax scaling, no percentile clipping.
-            # Critical for int4 QAT where the 16-level budget can't tolerate scale mismatch.
             row_max = t32.abs().amax(dim=1)
             scale = row_max.clamp_min(1e-8) / max_val
             q = torch.clamp(torch.round(t32 / scale[:, None]), -max_val - 1, max_val).to(torch.int8).contiguous()
@@ -419,7 +427,7 @@ def quantize_float_tensor(t: Tensor, bits: int = 8, use_amax: bool = False) -> t
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_amax: bool = False,
                              embed_bits: int | None = None, hessians: dict[str, Tensor] | None = None,
-                             gptq_damp: float = 0.01):
+                             gptq_damp: float = 0.01, use_sdclip: bool = False, sdclip_k: float = 2.5):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -461,10 +469,12 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, use_a
         # Block weights: use main bits with amax matching fake_quantize.
         is_embed = "tok_emb" in name
         t_bits = embed_bits if (embed_bits is not None and is_embed) else bits
-        if hessians is not None and t.ndim == 2 and not is_embed and name in hessians:
-            q, s = gptq_quantize_layer(t, hessians[name].cpu(), bits=t_bits, damp_percent=gptq_damp)
+        if hessians is not None and t.ndim == 2 and name in hessians:
+            q, s = gptq_quantize_layer(t, hessians[name].cpu(), bits=t_bits, damp_percent=gptq_damp,
+                                       use_sdclip=use_sdclip, sdclip_k=sdclip_k)
         else:
-            q, s = quantize_float_tensor(t, bits=t_bits, use_amax=(use_amax and not is_embed))
+            q, s = quantize_float_tensor(t, bits=t_bits, use_amax=(use_amax and not is_embed),
+                                         use_sdclip=use_sdclip, sdclip_k=sdclip_k)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q
@@ -510,7 +520,8 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-def gptq_quantize_layer(W: Tensor, H: Tensor, bits: int, damp_percent: float = 0.01) -> tuple[Tensor, Tensor]:
+def gptq_quantize_layer(W: Tensor, H: Tensor, bits: int, damp_percent: float = 0.01,
+                         use_sdclip: bool = False, sdclip_k: float = 2.5) -> tuple[Tensor, Tensor]:
     # GPTQ (Frantar et al. 2022): per-row scale, column-wise rounding with Hessian-aware
     # error redistribution. W is (out, in); H = X^T X is (in, in) from calibration.
     W = W.clone().float()
@@ -528,7 +539,10 @@ def gptq_quantize_layer(W: Tensor, H: Tensor, bits: int, damp_percent: float = 0
     Hinv = torch.cholesky_inverse(L)
     U = torch.linalg.cholesky(Hinv, upper=True)
     # Per-row scale chosen once from initial W (before column updates).
-    scale = W.abs().amax(dim=1).clamp_min(1e-8) / max_val
+    if use_sdclip:
+        scale = (sdclip_k * W.std(dim=1)).clamp_min(1e-8) / max_val
+    else:
+        scale = W.abs().amax(dim=1).clamp_min(1e-8) / max_val
     Q = torch.zeros_like(W)
     for c in range(n):
         w_c = W[:, c].clone()
@@ -543,24 +557,27 @@ def gptq_quantize_layer(W: Tensor, H: Tensor, bits: int, damp_percent: float = 0
 
 class GPTQCalibrator:
     # Forward-pre-hooks on every CastedLinear accumulate Hessian H = sum X^T X.
-    def __init__(self, base_model: nn.Module):
+    # Optional include_embed=True also captures the Hessian for the tied-embedding
+    # output projection (F.linear(x, tok_emb.weight)) via a hook on final_norm's output.
+    def __init__(self, base_model: nn.Module, include_embed: bool = False):
         self.Hs: dict[str, Tensor] = {}
         self.handles: list = []
         for mod_name, mod in base_model.named_modules():
             if isinstance(mod, CastedLinear):
-                key = mod_name + ".weight"
-                self.handles.append(mod.register_forward_pre_hook(self._mk_hook(key)))
-        # Cover the tied-embedding output projection path: F.linear(x, tok_emb.weight)
-        # is handled by fallback amax quantization (embedding is separately bit-widthed).
+                self.handles.append(mod.register_forward_pre_hook(self._mk_hook(mod_name + ".weight")))
+        if include_embed and getattr(base_model, "tie_embeddings", False) and hasattr(base_model, "final_norm"):
+            self.handles.append(base_model.final_norm.register_forward_hook(self._mk_post_hook("tok_emb.weight")))
 
     def _mk_hook(self, key: str):
         def hook(_m, inputs):
             x = inputs[0].detach().float().reshape(-1, inputs[0].size(-1))
-            h = x.T @ x
-            if key in self.Hs:
-                self.Hs[key] += h
-            else:
-                self.Hs[key] = h
+            self.Hs[key] = self.Hs.get(key, 0) + x.T @ x if not isinstance(self.Hs.get(key), Tensor) else self.Hs[key] + x.T @ x
+        return hook
+
+    def _mk_post_hook(self, key: str):
+        def hook(_m, _inputs, output):
+            x = output.detach().float().reshape(-1, output.size(-1))
+            self.Hs[key] = self.Hs.get(key, 0) + x.T @ x if not isinstance(self.Hs.get(key), Tensor) else self.Hs[key] + x.T @ x
         return hook
 
     def close(self):
@@ -570,7 +587,8 @@ class GPTQCalibrator:
 
 
 def run_gptq_calibration(base_model: nn.Module, train_loader: "DistributedTokenLoader",
-                         args: Hyperparameters, grad_accum_steps: int, device: torch.device):
+                         args: Hyperparameters, grad_accum_steps: int, device: torch.device,
+                         include_embed: bool = False):
     # Accumulate Hessians across ~gptq_calib_tokens of training data per rank, then all-reduce
     # so every rank quantizes against the same global calibration. QAT is temporarily disabled
     # because we calibrate against the real (non-fake-quantized) weights that will be exported.
@@ -580,7 +598,7 @@ def run_gptq_calibration(base_model: nn.Module, train_loader: "DistributedTokenL
             saved_qat[id(m)] = m._qat_bits
             m._qat_bits = 0
     base_model.eval()
-    calib = GPTQCalibrator(base_model)
+    calib = GPTQCalibrator(base_model, include_embed=include_embed)
     tokens_seen = 0
     with torch.no_grad():
         while tokens_seen < args.gptq_calib_tokens:
@@ -1340,14 +1358,15 @@ def main() -> None:
     embed_bits = args.embed_export_bits if args.embed_export_bits != args.export_bits else None
     hessians = None
     if args.quant_method == "gptq":
-        log0(f"gptq: calibrating on ~{args.gptq_calib_tokens} tokens (damp={args.gptq_damp_percent})")
+        log0(f"gptq: calibrating on ~{args.gptq_calib_tokens} tokens (damp={args.gptq_damp_percent} embed={args.gptq_embed} sdclip={args.use_sdclip} k={args.sdclip_k})")
         t_cal = time.perf_counter()
-        hessians = run_gptq_calibration(base_model, train_loader, args, grad_accum_steps, device)
+        hessians = run_gptq_calibration(base_model, train_loader, args, grad_accum_steps, device, include_embed=args.gptq_embed)
         log0(f"gptq: calibration done layers={len(hessians)} time={1000*(time.perf_counter()-t_cal):.0f}ms")
     quant_obj, quant_stats = quantize_state_dict_int8(
         base_model.state_dict(), bits=args.export_bits,
         use_amax=(args.qat_bits > 0 and hessians is None), embed_bits=embed_bits,
         hessians=hessians, gptq_damp=args.gptq_damp_percent,
+        use_sdclip=args.use_sdclip, sdclip_k=args.sdclip_k,
     )
     if hessians is not None:
         del hessians
