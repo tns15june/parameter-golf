@@ -39,12 +39,16 @@ run_smoke() {
     local name="$1"; shift
     echo ""
     echo "===== SMOKE: $name ====="
-    env $SMOKE_COMMON RUN_ID="smoke_$name" "$@" torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tail -15
+    # Full stdout+stderr → logs/smoke_<name>.full.log so tracebacks survive.
+    # Console sees only the tail so the user isn't drowning in 500 lines per smoke.
+    local full="logs/smoke_${name}.full.log"
+    mkdir -p logs
+    env $SMOKE_COMMON RUN_ID="smoke_$name" "$@" torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee "$full" | tail -15
     local status=${PIPESTATUS[0]}
     if [ $status -eq 0 ]; then
         echo "$name: PASS"
     else
-        echo "$name: FAIL (exit $status)"
+        echo "$name: FAIL (exit $status) — full log at $full"
         exit 1
     fi
 }
