@@ -971,7 +971,8 @@ class GPT(nn.Module):
                 dec_i = eff_i - self.num_encoder_layers
                 if self.parallel_later_residuals and skips:
                     w = F.softmax(self.late_mix[dec_i], dim=0).to(dtype=x.dtype)
-                    x = x + sum(w[e] * skips[e] for e in range(len(skips)))
+                    stacked = torch.stack(skips, dim=0)  # (num_enc, B, T, D)
+                    x = x + (w[:, None, None, None] * stacked).sum(dim=0)
                 elif skips:
                     x = x + self.skip_weights[dec_i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 x = self.blocks[block_idx](
