@@ -1,0 +1,14 @@
+# Shell scripts and Python sources must have LF line endings regardless of
+# the committer's platform. Prevents CRLF-from-Windows breaking `bash` on Linux pods.
+*.sh text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Binary assets should not be normalized.
+*.ptz binary
+*.bin binary
+*.model binary
+*.pt binary
