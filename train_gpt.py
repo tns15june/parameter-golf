@@ -96,6 +96,8 @@ class Hyperparameters:
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", os.environ.get("TRAIN_SEQ_LEN", "1024")))
     ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
     ttt_lr = float(os.environ.get("TTT_LR", "1e-5"))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", "4096"))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
 
     # Self-Generated GPTQ quantization (Hessian-aware column rounding).
     quant_method = os.environ.get("QUANT_METHOD", "amax")  # "amax" or "gptq"
@@ -320,6 +322,53 @@ def eval_val(
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
+def eval_val_legal_ttt(args, base_model, rank, world_size, device, val_tokens, blut, slut, bout):
+    # Legal score-first sliding TTT: score each chunk with pre-SGD weights,
+    # then run multi-epoch SGD on the chunk (embeds + control scalars only).
+    # Weight updates carry across chunks (causal: no future leakage).
+    seq_len, stride = args.eval_seq_len, max(args.eval_stride, 1)
+    chunk = max(args.ttt_chunk_tokens, seq_len * 2)
+    total = val_tokens.numel() - 1
+    nc = max((total + chunk - 1) // chunk, 1)
+    c0, c1 = (nc * rank) // world_size, (nc * (rank + 1)) // world_size
+    ttt_params = [p for n, p in base_model.named_parameters()
+                  if "tok_emb" in n or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]
+    init_state = [p.detach().clone() for p in ttt_params]
+    for p in base_model.parameters():
+        p.requires_grad_(any(p is q for q in ttt_params))
+    opt = torch.optim.Adam(ttt_params, lr=args.ttt_lr)
+    ls, tc, bc = (torch.zeros((), device=device, dtype=torch.float64) for _ in range(3))
+    for ci in range(c0, c1):
+        s0, s1 = ci * chunk, min((ci + 1) * chunk, total)
+        ck = val_tokens[s0:s1 + 1].to(device, dtype=torch.int64)
+        wins = list(range(0, max(1, ck.numel() - seq_len), stride))
+        base_model.eval()
+        with torch.inference_mode():
+            for w in wins:
+                x, y = ck[w:w + seq_len].unsqueeze(0), ck[w + 1:w + seq_len + 1].unsqueeze(0)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = base_model(x, y)
+                ls += loss.detach().to(torch.float64) * y.numel(); tc += float(y.numel())
+                r = y.reshape(-1)
+                bc += (blut[r].to(torch.int16) + (slut[r] & ~bout[x.reshape(-1)]).to(torch.int16)).to(torch.float64).sum()
+        base_model.train()
+        for _ in range(args.ttt_epochs):
+            for w in wins:
+                x, y = ck[w:w + seq_len].unsqueeze(0), ck[w + 1:w + seq_len + 1].unsqueeze(0)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = base_model(x, y)
+                loss.backward(); opt.step(); opt.zero_grad()
+    for p, s in zip(ttt_params, init_state):
+        p.data.copy_(s)
+    for p in base_model.parameters():
+        p.requires_grad_(True)
+    if dist.is_available() and dist.is_initialized():
+        for t in [ls, tc, bc]:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    vl = (ls / tc).item()
+    return vl, (vl / math.log(2.0)) * (tc.item() / bc.item())
+
+
 def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
                      blut, slut, bout, seq_len, stride) -> tuple[float, float]:
     nt = val_tokens.numel() - 1
@@ -358,22 +407,9 @@ def eval_val_sliding(args, model, rank, world_size, device, val_tokens,
 # Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
 # We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
-CONTROL_TENSOR_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
-    ).split(",")
-    if pattern
-)
-INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
-    pattern
-    for pattern in os.environ.get(
-        "INT8_KEEP_FLOAT_FP32_NAME_PATTERNS",
-        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
-    ).split(",")
-    if pattern
-)
+_DEFAULT_CONTROL_PATTERNS = "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights"
+CONTROL_TENSOR_NAME_PATTERNS = tuple(p for p in os.environ.get("CONTROL_TENSOR_NAME_PATTERNS", _DEFAULT_CONTROL_PATTERNS).split(",") if p)
+INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(p for p in os.environ.get("INT8_KEEP_FLOAT_FP32_NAME_PATTERNS", ",".join(CONTROL_TENSOR_NAME_PATTERNS)).split(",") if p)
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
@@ -1119,34 +1155,15 @@ def main() -> None:
         gpt_scalar_params.append(base_model.skip_weights)
     scalar_params = scalar_params_from_blocks + gpt_scalar_params
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-    )
+    adam_kw = dict(betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
+    optimizer_tok = torch.optim.Adam([{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}], **adam_kw)
+    optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps)
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
-        betas=(args.beta1, args.beta2),
-        eps=args.adam_eps,
-        fused=True,
-    )
+    optimizer_scalar = torch.optim.Adam([{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}], **adam_kw)
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
     if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
-            [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
-            betas=(args.beta1, args.beta2),
-            eps=args.adam_eps,
-            fused=True,
-        )
+        optimizer_head = torch.optim.Adam([{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}], **adam_kw)
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
@@ -1158,8 +1175,6 @@ def main() -> None:
     )
     if args.qat_bits > 0:
         log0(f"qat: bits={args.qat_bits} start_frac={args.qat_start_frac} export_bits={args.export_bits} embed_export_bits={args.embed_export_bits}")
-    if args.eval_seq_len != args.train_seq_len:
-        log0(f"eval: seq_len={args.eval_seq_len} rope_scale={args.eval_rope_scale} ttt={args.ttt_enabled}")
     if args.ema_decay > 0 or args.eval_stride > 0:
         log0(f"ema:{args.ema_decay} eval_stride:{args.eval_stride}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
@@ -1436,8 +1451,12 @@ def main() -> None:
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     if args.ttt_enabled:
-        raise RuntimeError("TTT_ENABLED=1 requires legal score-first sliding TTT (not yet ported on this branch)")
-    if 0 < args.eval_stride < args.eval_seq_len:
+        log0(f"Legal score-first sliding TTT (chunk={args.ttt_chunk_tokens} epochs={args.ttt_epochs} lr={args.ttt_lr})")
+        q_val_loss, q_val_bpb = eval_val_legal_ttt(
+            args, base_model, rank, world_size, device, val_tokens,
+            base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+    elif 0 < args.eval_stride < args.eval_seq_len:
         log0(f"Running sliding window eval (stride={args.eval_stride}, seq_len={args.eval_seq_len})...")
         q_val_loss, q_val_bpb = eval_val_sliding(
             args, base_model, rank, world_size, device, val_tokens,
