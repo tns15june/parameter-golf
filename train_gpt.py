@@ -123,6 +123,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))  # frontier records use ~0.09
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
@@ -155,11 +156,8 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
-        super().__init__(
-            params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
-        )
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True, weight_decay: float = 0.0):
+        super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay))
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -204,9 +202,12 @@ class Muon(torch.optim.Optimizer):
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
+            wd = group.get("weight_decay", 0.0)
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if wd != 0.0:
+                    p.data.mul_(1.0 - lr * wd)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -763,14 +764,6 @@ class CastedLinear(nn.Linear):
         return F.linear(x, w, bias)
 
 
-def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
-    # Keep small/control parameters in fp32 even when the model body runs in bf16.
-    with torch.no_grad():
-        for name, param in module.named_parameters():
-            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
-                param.data = param.data.float()
-
-
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1124,7 +1117,10 @@ def main() -> None:
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
-    restore_low_dim_params_to_fp32(base_model)
+    with torch.no_grad():
+        for name, param in base_model.named_parameters():
+            if (param.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
+                param.data = param.data.float()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1157,7 +1153,7 @@ def main() -> None:
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     adam_kw = dict(betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=True)
     optimizer_tok = torch.optim.Adam([{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}], **adam_kw)
-    optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps)
+    optimizer_muon = Muon(matrix_params, lr=args.matrix_lr, momentum=args.muon_momentum, backend_steps=args.muon_backend_steps, weight_decay=args.muon_weight_decay)
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam([{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}], **adam_kw)
