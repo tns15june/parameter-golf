@@ -9,3 +9,11 @@ data/docs_selected.jsonl
 .mypy_cache/
 .venv
 logs/
+
+# Secrets — never commit
+huggingface_token.txt
+*.token
+*.pem
+.env
+.env.*
+credentials.json
