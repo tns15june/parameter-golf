@@ -1,13 +1,23 @@
 #!/bin/bash
 # One-command RunPod launcher — survives SSH disconnects via nohup
-# Usage: bash dev/runpod_go.sh [final|wide|validate]
-#   final    — 8xH100 submission run with dim=512 (default)
-#   wide     — 8xH100 submission run with dim=1024
-#   validate — 1xGPU validation of experiments 4+5 (RoPE + TTT)
+# Usage: bash dev/runpod_go.sh [final|frontier|smoke|wide|validate]
+#   frontier — 8xH100 SP8192 frontier-port submission (the competition run)
+#   smoke    — 1xH100 per-component smoke tests (calls dev/smoke_frontier.sh)
+#   final    — 8xH100 SP1024 v4 fallback run (beats baseline only)
+#   wide     — 8xH100 SP1024 dim=1024 variant
+#   validate — 1xGPU legacy validation experiments (SP1024)
 
 set -e
-MODE="${1:-final}"
+MODE="${1:-frontier}"
 NGPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+
+# Decide which dataset variant the selected mode needs.
+case "$MODE" in
+    frontier|smoke) VARIANT=sp8192 ;;
+    final|wide|validate) VARIANT=sp1024 ;;
+    *) VARIANT=sp1024 ;;
+esac
+DATA_DIR="data/datasets/fineweb10B_${VARIANT}"
 
 echo "============================================================"
 echo "  PARAMETER GOLF — RunPod Launcher"
@@ -30,18 +40,32 @@ fi
 
 pip install -q -r requirements.txt
 
-# Download dataset if needed
-TRAIN_SHARD_COUNT=$(ls data/datasets/fineweb10B_sp1024/fineweb_train_*.bin 2>/dev/null | wc -l)
-if [ "$TRAIN_SHARD_COUNT" -lt 80 ]; then
-    echo "Downloading dataset..."
-    python3 data/cached_challenge_fineweb.py --variant sp1024
+# Download dataset if needed (variant chosen by mode above)
+TRAIN_SHARD_COUNT=$(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l)
+# For smoke mode a small subset is enough; for real runs we need the full 80 shards.
+MIN_SHARDS=$([ "$MODE" = "smoke" ] && echo 4 || echo 80)
+if [ "$TRAIN_SHARD_COUNT" -lt "$MIN_SHARDS" ]; then
+    echo "Downloading $VARIANT dataset (have $TRAIN_SHARD_COUNT shards, need $MIN_SHARDS)..."
+    if [ "$MODE" = "smoke" ]; then
+        python3 data/cached_challenge_fineweb.py --variant "$VARIANT" --train-shards 4
+    else
+        python3 data/cached_challenge_fineweb.py --variant "$VARIANT"
+    fi
 fi
-echo "Dataset ready: $(ls data/datasets/fineweb10B_sp1024/fineweb_train_*.bin | wc -l) train shards"
+echo "Dataset ready: $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) train shards ($VARIANT)"
 
 # Select config
 case "$MODE" in
+    frontier)
+        echo "Running FRONTIER submission (SP8192 stack, 8xH100)..."
+        bash dev/run_frontier.sh
+        ;;
+    smoke)
+        echo "Running FRONTIER smoke tests (1xH100)..."
+        bash dev/smoke_frontier.sh "${2:-all}"
+        ;;
     final)
-        echo "Running FINAL submission (dim=512, 8xH100)..."
+        echo "Running FINAL submission (dim=512, SP1024 v4, 8xH100)..."
         bash dev/run_final.sh
         ;;
     wide)
@@ -64,7 +88,7 @@ case "$MODE" in
         ;;
     *)
         echo "Unknown mode: $MODE"
-        echo "Usage: bash dev/runpod_go.sh [final|wide|validate]"
+        echo "Usage: bash dev/runpod_go.sh [frontier|smoke|final|wide|validate]"
         exit 1
         ;;
 esac
