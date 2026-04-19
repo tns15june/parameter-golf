@@ -1,23 +1,30 @@
 #!/bin/bash
 # One-command RunPod launcher — survives SSH disconnects via nohup
-# Usage: bash dev/runpod_go.sh [final|frontier|smoke|wide|validate]
-#   frontier — 8xH100 SP8192 frontier-port submission (the competition run)
-#   smoke    — 1xH100 per-component smoke tests (calls dev/smoke_frontier.sh)
-#   final    — 8xH100 SP1024 v4 fallback run (beats baseline only)
-#   wide     — 8xH100 SP1024 dim=1024 variant
-#   validate — 1xGPU legacy validation experiments (SP1024)
+# Usage: bash dev/runpod_go.sh [MODE]
+#   frontier     — 8xH100 SP8192 frontier-port submission (the competition run).
+#                  Requires SP8192 data on the volume; runs prep first if missing.
+#   prep-sp8192  — 1xH100 data prep ONLY: train SP8192 BPE + retokenize docs,
+#                  then exit. Use this on a cheap 1xH100 pod before spinning up
+#                  the 8xH100 — frontier mode itself would happily launch
+#                  torchrun --nproc_per_node=8 and fail on a 1-GPU pod.
+#   smoke [case] — 1xH100 per-component smoke tests (calls dev/smoke_frontier.sh).
+#                  case=sp8192 exercises the SP8192 code path (requires Phase A
+#                  data to exist on the volume). Other cases use SP1024.
+#   final        — 8xH100 SP1024 v4 fallback run (beats baseline only)
+#   wide         — 8xH100 SP1024 dim=1024 variant
+#   validate     — 1xGPU legacy validation experiments (SP1024)
 
 set -e
 MODE="${1:-frontier}"
 NGPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 
-# frontier mode uses SP8192 (trained + retokenized locally via tokenizer_specs.json).
-# smoke + other modes use SP1024 (pre-published in upstream manifest).
-if [ "$MODE" = "frontier" ]; then
-    VARIANT=sp8192
-else
-    VARIANT=sp1024
-fi
+# Variant selection: frontier + prep-sp8192 use SP8192 (retokenized locally).
+# smoke + other modes use SP1024 (pre-published). The sp8192 smoke case checks
+# its own data independently so we don't need SP1024 here — gate that below.
+case "$MODE" in
+    frontier|prep-sp8192) VARIANT=sp8192 ;;
+    *) VARIANT=sp1024 ;;
+esac
 DATA_DIR="data/datasets/fineweb10B_${VARIANT}"
 
 echo "============================================================"
@@ -41,10 +48,16 @@ fi
 
 pip install -q -r requirements.txt
 
+# Skip dataset setup entirely for `smoke sp8192` — that case gates on its own
+# SP8192 data existence and doesn't need SP1024 downloaded.
+if [ "$MODE" = "smoke" ] && [ "${2:-all}" = "sp8192" ]; then
+    SKIP_DATA_SETUP=1
+fi
+
 # Download dataset if needed (variant chosen by mode above).
 TRAIN_SHARD_COUNT=$(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l)
 MIN_SHARDS=$([ "$MODE" = "smoke" ] && echo 4 || echo 80)
-if [ "$TRAIN_SHARD_COUNT" -lt "$MIN_SHARDS" ]; then
+if [ "${SKIP_DATA_SETUP:-0}" = "0" ] && [ "$TRAIN_SHARD_COUNT" -lt "$MIN_SHARDS" ]; then
     if [ "$VARIANT" = "sp8192" ]; then
         # SP8192 is NOT published pre-tokenized. Produce it locally. Use the
         # SP8192-only tokenizer config so we don't also rebuild SP1024 (which
@@ -65,13 +78,24 @@ if [ "$TRAIN_SHARD_COUNT" -lt "$MIN_SHARDS" ]; then
         fi
     fi
 fi
-echo "Dataset ready: $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) train shards ($VARIANT)"
+if [ "${SKIP_DATA_SETUP:-0}" = "0" ]; then
+    echo "Dataset ready: $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) train shards ($VARIANT)"
+fi
 
 # Select config
 case "$MODE" in
     frontier)
+        if [ "$NGPUS" -lt 8 ]; then
+            echo "ERROR: frontier mode runs torchrun --nproc_per_node=8 but this pod has $NGPUS GPU(s)."
+            echo "  - For data prep only on 1xH100, use: bash dev/runpod_go.sh prep-sp8192"
+            echo "  - For the real run, provision an 8xH100 pod first."
+            exit 1
+        fi
         echo "Running FRONTIER submission (SP8192 stack, 8xH100)..."
         bash dev/run_frontier.sh
+        ;;
+    prep-sp8192)
+        echo "SP8192 data prep complete. Skipping training (mode=prep-sp8192)."
         ;;
     smoke)
         echo "Running FRONTIER smoke tests (1xH100)..."
@@ -101,7 +125,7 @@ case "$MODE" in
         ;;
     *)
         echo "Unknown mode: $MODE"
-        echo "Usage: bash dev/runpod_go.sh [frontier|smoke|final|wide|validate]"
+        echo "Usage: bash dev/runpod_go.sh [frontier|prep-sp8192|smoke|final|wide|validate]"
         exit 1
         ;;
 esac

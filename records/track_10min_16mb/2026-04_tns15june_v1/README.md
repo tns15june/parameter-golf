@@ -46,15 +46,23 @@ TRAIN_BATCH_TOKENS=524288 MAX_WALLCLOCK_SECONDS=600
 ### Data Prep (one-time on 1×H100, ~2–3 hrs, ~$7)
 
 SP8192 is **not** published pre-tokenized by the upstream manifest. Produce it
-locally:
+locally with the SP8192-only tokenizer config (using the combined config also
+instantiates `sp_bpe_1024` which double-processes the corpus AND hits a
+unlink-before-reuse bug in `build_sentencepiece_tokenizer` when
+`--reuse-sp-model 1024=...` points at the SP1024 target of that same spec):
 
 ```bash
 python3 data/download_hf_docs_and_tokenize.py \
-    --output-root data --tokenizer-config data/tokenizer_specs.json \
-    --skip-byte --reuse-sp-model 1024=data/tokenizers/fineweb_1024_bpe.model
+    --output-root data \
+    --tokenizer-config data/tokenizer_specs_sp8192.json \
+    --skip-byte
 ```
 
-The tokenizer spec is in `data/tokenizer_specs.json` under `sp_bpe_8192`.
+Or via the launcher, which wraps exactly this call:
+
+```bash
+bash dev/runpod_go.sh prep-sp8192
+```
 
 ### Run
 

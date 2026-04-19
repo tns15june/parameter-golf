@@ -17,10 +17,16 @@ fi
 
 pip install -q -r requirements.txt
 
+COMPONENT="${1:-all}"
 DATA_DIR="data/datasets/fineweb10B_sp1024"
-if [ ! -d "$DATA_DIR" ] || [ $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) -lt 1 ]; then
-    echo "Downloading SP1024 data (4 shards for smoke)..."
-    python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 4
+
+# Only download SP1024 if the requested component needs it. `sp8192` exercises a
+# separate data path and any other SP1024-requiring case triggers setup.
+if [ "$COMPONENT" != "sp8192" ]; then
+    if [ ! -d "$DATA_DIR" ] || [ $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) -lt 1 ]; then
+        echo "Downloading SP1024 data (4 shards for smoke)..."
+        python3 data/cached_challenge_fineweb.py --variant sp1024 --train-shards 4
+    fi
 fi
 
 SMOKE_COMMON="DATA_PATH=$DATA_DIR TOKENIZER_PATH=data/tokenizers/fineweb_1024_bpe.model VOCAB_SIZE=1024 \
@@ -43,7 +49,6 @@ run_smoke() {
     fi
 }
 
-COMPONENT="${1:-all}"
 ALL=false
 [ "$COMPONENT" = "all" ] && ALL=true
 
