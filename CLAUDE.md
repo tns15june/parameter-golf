@@ -82,7 +82,7 @@ Transformer with these non-standard elements:
 - **Residual mixing**: Each effective layer blends current hidden state with original post-embedding state x0 via learned `resid_mix[0]*x + resid_mix[1]*x0`.
 - **CastedLinear**: Weights in fp32, cast to bf16 at compute time. Supports QAT via `_qat_bits` class variable.
 - **GQA**: Grouped-query attention (default 8 query heads, 4 KV heads). QK normalization with learned per-head q_gain.
-- **relu²**: `relu(x)²` activation in MLP (not GELU).
+- **leaky_relu²**: `leaky_relu(x, neg_slope=0.01)²` activation in MLP (not GELU).
 - **Zero-init**: attn.proj and mlp.proj weights initialized to zero (blocks start as identity).
 - **Logit softcap**: `30 × tanh(logits/30)` clamps output logits.
 - **Tied embeddings**: tok_emb shared with output projection (default).
@@ -144,7 +144,7 @@ The `train_gpt.py` must compile and run independently within the records folder.
 
 ## Implementation Status
 
-All features (depth recurrence, QAT, eval-time optimization) are implemented in `train_gpt.py` with backward-compatible defaults. **NOT YET TESTED ON GPU.**
+All features (depth recurrence, QAT, eval-time optimization, EMA, sliding-window eval, LeakyReLU²) are implemented in `train_gpt.py` with backward-compatible defaults. Iterated on RunPod 1×H100; final 8×H100 submission run pending — see `dev/run_final.sh` for the production config and `runpod_validate.sh` for the smoke-test pipeline.
 
 ### Potential Issues
 
@@ -152,20 +152,56 @@ All features (depth recurrence, QAT, eval-time optimization) are implemented in 
 - eval_val with eval_seq_len > train_seq_len: trailing val tokens truncated to seq_len multiple
 - Depth recurrence in compiled forward: static loop count, round-robin is deterministic — should work
 
-### Optimization Strategy (v3 — competitive config)
+### Optimization Strategy (v4 — after Phase A findings 2026-04-19)
 
-1. **10 layers, 3x MLP**: More capacity (~24M params), fits in 16MB with int6+lzma
+1. **10 layers, 2x MLP**: Depth over width. ~18M params. ~12 MB artifact (fits 16 MB with headroom).
 2. **LeakyReLU²**: Better gradient flow than ReLU² (prevents dead neurons)
 3. **Int6 QAT at 15%**: Start fake quantization early to minimize export gap
 4. **EMA (0.9995)**: Smoother weights → better generalization + compression
-5. **Sliding window eval**: stride=256, seq_len=2048 — every token gets warm context
+5. **Sliding window eval, seq_len=1024 (MATCHES train)**: stride=256 for warm-context. NO RoPE scaling.
 6. **lzma compression**: Better ratio than zlib for int6 values
 
-Target config: `NUM_UNIQUE_LAYERS=10 MLP_MULT=3 QAT_BITS=6 QAT_START_FRAC=0.15 EXPORT_BITS=6 EMA_DECAY=0.9995 EVAL_SEQ_LEN=2048 EVAL_STRIDE=256`
+Target config: `NUM_UNIQUE_LAYERS=10 MLP_MULT=2 QAT_BITS=6 QAT_START_FRAC=0.15 EXPORT_BITS=6 EMA_DECAY=0.9995 EVAL_SEQ_LEN=1024 EVAL_STRIDE=256`
+
+### Phase A findings (2026-04-19, 8×H100 runs)
+
+**Run 1 (v2, failed):** Stale GitHub code (9L + n-gram eval). n-gram ran only on rank 0, other ranks blocked on subsequent collective → 10-min NCCL watchdog killed it. Post-export eval never produced a number. ~$12 spent.
+
+**Run 2 (v3, diagnostic):** 10L × MLP=3 × dim=512 × EVAL_SEQ_LEN=2048. Revealed two bugs:
+- **Artifact over 16 MB**: 16.27 MB vs 16.00 MB cap (disqualifying)
+- **Catastrophic export gap**: 0.57 BPB. pre=1.1919 (at train_seq_len=1024) → post=1.7615 (at eval_seq_len=2048 with RoPE base 10000→20000)
+- Root cause: model trained at 1024 cannot extrapolate to 2048 via linear RoPE scaling without position-interpolation training (YaRN/NTK-aware/etc.)
+
+**v4 fix**: MLP_MULT=3→2 (fit 16 MB); EVAL_SEQ_LEN=2048→1024 (eliminate extrapolation). Expected post_bpb ~1.22, export_gap <0.05.
+
+### Next phases (plan, 2026-04-19)
+
+**Phase A retry (v4)** — 8×H100, ~$8, ~15 min. Command:
+```
+cd /workspace/parameter-golf && git pull && rm -f final_model.int*.ptz && bash dev/runpod_go.sh final 2>&1 | tee /workspace/phase_a_v4.log
+```
+
+**Phase B (GPTQ ablation)** — 1×H100, ~$3, ~30 min. Command:
+```
+bash dev/run_gptq_ablate.sh
+```
+Compares: amax int6 / GPTQ int6 / GPTQ int4 / GPTQ int4+dim768. Decision:
+- If GPTQ int6 gap < amax int6 gap by >0.005: GPTQ works for int6
+- If GPTQ int4 gap < 0.015: int4 viable — use freed bytes for dim=768
+
+**Phase C (final submission)** — 8×H100, ~$10. Command based on Phase B winner:
+```
+bash dev/run_final_gptq.sh [int6|wide]
+```
+
+**Phase D stretch (if time/budget allow)** — XSA (cross-sequence attention, what #1 uses). Requires code changes to attention mask + sequence packing.
+
+**Budget so far**: ~$20/$100 spent. Remaining: ~$80 covers v4 ($8) + Phase B ($3) + Phase C ($10) + ~$60 for iteration/stretch goals.
 
 ### Still TODO (potential further gains)
 
 - **XSA** (cross-sequence attention): #1 uses this — attention across sequence boundaries
-- **Self-Generated GPTQ**: Better per-layer quantization with calibration data
+- **Self-Generated GPTQ**: Better per-layer quantization with calibration data (dormant scaffold already in train_gpt.py, enable via `QUANT_METHOD=gptq`)
 - **TTT with LoRA**: More expressive test-time training than current embed+scalar TTT
+- **Position interpolation training**: Would unlock EVAL_SEQ_LEN>TRAIN_SEQ_LEN path (currently breaks)
 - **Tokenizer optimization**: BPE 8192 vocab explored by some submissions

@@ -40,11 +40,12 @@ def main():
     submission = {
         "author": "Tarkeshwar Narayan Sharma",
         "github_id": "tns15june",
-        "name": "Baseline 9L/512d + int6 LZMA + N-gram Eval",
+        "name": "10L/512d LeakyReLU\u00b2 + int6 QAT + EMA + Sliding Window",
         "blurb": (
-            "9-layer dim=512 baseline architecture, no recurrence, no QAT. "
-            "int6 block weights + int8 embeddings with LZMA compression. "
-            f"N-gram eval cache. Post-quant roundtrip BPB: {val_bpb:.4f}."
+            "10-layer dim=512 with 3x MLP and LeakyReLU\u00b2 activation. "
+            "int6 QAT (start at 15%) + int8 embeddings, LZMA-compressed. "
+            "EMA(0.9995) of weights for export. Sliding-window eval (seq_len=2048, stride=256). "
+            f"Post-quant roundtrip BPB: {val_bpb:.4f}."
         ),
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "val_loss": val_loss,

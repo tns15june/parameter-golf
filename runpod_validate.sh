@@ -8,21 +8,24 @@
 # Strategy: repair the scoring pipeline, then optimize the real objective.
 #   final_bpb = model_quality + export_gap + eval_gap
 #
-# Experiment order:
-#   1. no_qat_int8      — prove architecture is stable (int8 export)
-#   2. no_qat_mixed     — validate mixed-precision export (int4 blocks + int8 embed)
-#   3. qat_mixed        — validate QAT reduces int4 export gap
-#   4. eval_rope_only   — test RoPE scaling alone
-#   5. eval_ttt_only    — test TTT alone
+# Experiment order (uses 9L/MLP=2 baseline arch except where noted):
+#   1. no_qat_int8       — prove architecture is stable (int8 export)
+#   2. no_qat_int6_zlib  — int6 mixed-precision export, no QAT
+#   3. int6_lzma         — int6 + LZMA (submission core export pipeline)
+#   4. int6_lzma_ngram   — adds n-gram eval cache on top of int6+LZMA
+#   5. int6_lzma_rope    — adds RoPE 4x context scaling on top of int6+LZMA
+#   6. submission_full   — mirrors dev/run_final.sh (10L/MLP=3/QAT/EMA/sliding)
 #
 # Requirements: RunPod pod with 1×H100+ and 50GB+ disk
-# Cost estimate: ~$4-5 on 1×H100 (~65 min total)
+# Cost estimate: ~$5-6 on 1×H100 (~75 min total)
 # =============================================================================
 
 set -e
 
 RESULTS_FILE="/workspace/parameter-golf/validation_results.txt"
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
+# Per-experiment GPU count: each experiment invocation passes its own value, but most
+# small-config probes use 1 GPU because they're cheap. submission_full uses all available.
 
 # Score-aware thresholds
 MAX_EXPORT_GAP_INT8=0.02    # int8 gap must be < 0.02 BPB
@@ -195,7 +198,7 @@ echo "---" >> "$RESULTS_FILE"
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "  [1/5] Architecture baseline (no QAT, int8 export)"
+echo "  [1/6] Architecture baseline (no QAT, int8 export)"
 echo "============================================================"
 
 run_experiment "no_qat_int8" \
@@ -211,7 +214,7 @@ run_experiment "no_qat_int8" \
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "  [2/5] Mixed-precision export (int6 blocks + int8 embed, zlib)"
+echo "  [2/6] Mixed-precision export (int6 blocks + int8 embed, zlib)"
 echo "============================================================"
 
 run_experiment "no_qat_int6_zlib" \
@@ -228,7 +231,7 @@ run_experiment "no_qat_int6_zlib" \
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "  [3/5] int6 + LZMA export (submission core)"
+echo "  [3/6] int6 + LZMA export (submission core)"
 echo "============================================================"
 
 run_experiment "int6_lzma" \
@@ -245,7 +248,7 @@ run_experiment "int6_lzma" \
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "  [4/5] N-gram eval on int6+LZMA"
+echo "  [4/6] N-gram eval on int6+LZMA"
 echo "============================================================"
 
 run_experiment "int6_lzma_ngram" \
@@ -263,7 +266,7 @@ run_experiment "int6_lzma_ngram" \
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "  [5/5] RoPE 4x scaling on int6+LZMA"
+echo "  [5/6] RoPE 4x scaling on int6+LZMA"
 echo "============================================================"
 
 run_experiment "int6_lzma_rope" \
@@ -272,6 +275,29 @@ run_experiment "int6_lzma_rope" \
     1 \
     EXPORT_BITS=6 EMBED_EXPORT_BITS=8 COMPRESS_METHOD=lzma \
     EVAL_SEQ_LEN=4096 \
+    || true
+
+# =============================================================================
+# EXPERIMENT 6: Full submission config — mirrors dev/run_final.sh
+# Purpose: End-to-end smoke test of the actual submission pipeline.
+#          Uses all available GPUs so timing is comparable to a real submission run.
+#          On 1×H100 the BPB will be uncompetitive (only ~1/8 the training); the
+#          point here is to verify the pipeline runs without crashing and the
+#          export gap is within budget.
+# =============================================================================
+echo ""
+echo "============================================================"
+echo "  [6/6] Submission config end-to-end (10L/MLP=3/QAT/EMA/sliding)"
+echo "============================================================"
+
+run_experiment "submission_full" \
+    "Mirrors dev/run_final.sh: 10L/MLP=3/LeakyReLU2/QAT6/EMA/sliding-window/LZMA" \
+    "$MAX_EXPORT_GAP_INT4" \
+    "$NUM_GPUS" \
+    NUM_UNIQUE_LAYERS=10 NUM_RECURRENCES=1 MLP_MULT=3 \
+    QAT_BITS=6 QAT_START_FRAC=0.15 EXPORT_BITS=6 EMBED_EXPORT_BITS=8 \
+    EMA_DECAY=0.9995 EVAL_SEQ_LEN=2048 EVAL_STRIDE=256 \
+    COMPRESS_METHOD=lzma \
     || true
 
 # =============================================================================
@@ -336,9 +362,13 @@ check_experiment "int6+zlib export" "no_qat_int6_zlib"
 check_experiment "int6+LZMA export (submission core)" "int6_lzma"
 check_experiment "N-gram eval on int6+LZMA" "int6_lzma_ngram"
 check_experiment "RoPE scaling on int6+LZMA" "int6_lzma_rope"
+check_experiment "Submission config end-to-end" "submission_full"
 
-# Size check from submission core experiment
-compressed_bytes=$(echo "$results_content" | grep "int6_lzma " | grep -oP 'compressed=\K\d+' || echo "0")
+# Size check — prefer submission_full, fall back to int6_lzma core export.
+compressed_bytes=$(echo "$results_content" | grep "^submission_full |" | grep -oP 'compressed=\K\d+' || echo "0")
+if [ "$compressed_bytes" = "0" ]; then
+    compressed_bytes=$(echo "$results_content" | grep "^int6_lzma |" | grep -oP 'compressed=\K\d+' || echo "0")
+fi
 if [ -f "train_gpt.py" ] && [ "$compressed_bytes" -gt 0 ]; then
     code_bytes=$(wc -c < train_gpt.py)
     total=$((compressed_bytes + code_bytes))
