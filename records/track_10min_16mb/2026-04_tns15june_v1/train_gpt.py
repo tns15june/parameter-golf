@@ -98,6 +98,7 @@ class Hyperparameters:
     ttt_lr = float(os.environ.get("TTT_LR", "1e-5"))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", "4096"))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", "3"))
+    ttt_max_chunks = int(os.environ.get("TTT_MAX_CHUNKS", "0"))  # 0 = all (full val)
 
     # Self-Generated GPTQ quantization (Hessian-aware column rounding).
     quant_method = os.environ.get("QUANT_METHOD", "amax")  # "amax" or "gptq"
@@ -331,6 +332,8 @@ def eval_val_legal_ttt(args, base_model, rank, world_size, device, val_tokens, b
     chunk = max(args.ttt_chunk_tokens, seq_len * 2)
     total = val_tokens.numel() - 1
     nc = max((total + chunk - 1) // chunk, 1)
+    if args.ttt_max_chunks > 0:
+        nc = min(nc, args.ttt_max_chunks)
     c0, c1 = (nc * rank) // world_size, (nc * (rank + 1)) // world_size
     ttt_params = [p for n, p in base_model.named_parameters()
                   if "tok_emb" in n or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]

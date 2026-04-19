@@ -33,8 +33,12 @@ QAT_BITS="${QAT_BITS:-6}" \
 QAT_START_FRAC="${QAT_START_FRAC:-0.15}" \
 EXPORT_BITS="${EXPORT_BITS:-6}" \
 EMBED_EXPORT_BITS="${EMBED_EXPORT_BITS:-6}" \
+# GPTQ_EMBED disabled: the tied-embedding Hessian captured via final_norm hook
+# optimises the F.linear output path but degrades the embedding-lookup path that
+# shares the same weight. Until we have a combined Hessian (or a per-row scheme
+# that keeps lookup intact), the ~2 BPB export gap makes this unsafe to enable.
 QUANT_METHOD="${QUANT_METHOD:-gptq}" \
-GPTQ_EMBED="${GPTQ_EMBED:-1}" \
+GPTQ_EMBED="${GPTQ_EMBED:-0}" \
 USE_SDCLIP="${USE_SDCLIP:-1}" \
 SDCLIP_K="${SDCLIP_K:-2.5}" \
 \
