@@ -79,6 +79,10 @@ class Hyperparameters:
     # Depth recurrence: share weights across layers for wider models.
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", os.environ.get("NUM_LAYERS", "9")))
     num_recurrences = int(os.environ.get("NUM_RECURRENCES", "1"))
+    # Targeted recurrence: loop a middle slice of layers instead of generic modulo round-robin.
+    targeted_recurrence = bool(int(os.environ.get("TARGETED_RECURRENCE", "0")))
+    recurrence_start_layer = int(os.environ.get("RECURRENCE_START_LAYER", "4"))
+    recurrence_end_layer = int(os.environ.get("RECURRENCE_END_LAYER", "7"))
     # Parallel residuals: attn and MLP both read the pre-residual state (frontier delta ~0.01 BPB).
     parallel_residuals = bool(int(os.environ.get("PARALLEL_RESIDUALS", "0")))
 
@@ -873,6 +877,9 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         parallel_residuals: bool = False,
+        targeted_recurrence: bool = False,
+        recurrence_start_layer: int = 0,
+        recurrence_end_layer: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -882,7 +889,14 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.rope_base = rope_base
         self.num_unique_layers = num_unique_layers
-        self.num_effective_layers = num_unique_layers * num_recurrences
+        if targeted_recurrence and num_recurrences > 1:
+            mid = list(range(recurrence_start_layer, recurrence_end_layer + 1))
+            head = list(range(recurrence_end_layer + 1))
+            tail = list(range(recurrence_end_layer + 1, num_unique_layers))
+            self.visit_schedule = head + mid * (num_recurrences - 1) + tail
+        else:
+            self.visit_schedule = [i % num_unique_layers for i in range(num_unique_layers * num_recurrences)]
+        self.num_effective_layers = len(self.visit_schedule)
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
 
         # U-Net skip logic based on effective (not unique) layers
@@ -925,7 +939,7 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
 
         for eff_i in range(self.num_effective_layers):
-            block_idx = eff_i % self.num_unique_layers
+            block_idx = self.visit_schedule[eff_i]
             if eff_i < self.num_encoder_layers:
                 x = self.blocks[block_idx](
                     x, x0, self.attn_scales[eff_i], self.mlp_scales[eff_i],
@@ -1067,6 +1081,9 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         parallel_residuals=args.parallel_residuals,
+        targeted_recurrence=args.targeted_recurrence,
+        recurrence_start_layer=args.recurrence_start_layer,
+        recurrence_end_layer=args.recurrence_end_layer,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1136,7 +1153,8 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(
         f"depth_recurrence: unique_layers:{args.num_unique_layers} recurrences:{args.num_recurrences} "
-        f"effective_layers:{base_model.num_effective_layers}"
+        f"effective_layers:{base_model.num_effective_layers} "
+        f"targeted:{args.targeted_recurrence} schedule:{base_model.visit_schedule}"
     )
     if args.qat_bits > 0:
         log0(f"qat: bits={args.qat_bits} start_frac={args.qat_start_frac} export_bits={args.export_bits} embed_export_bits={args.embed_export_bits}")
