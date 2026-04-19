@@ -1,16 +1,12 @@
 #!/bin/bash
 # Per-component smoke tests for the frontier port on 1xH100.
-# Runs a small SP8192 config (~500 iters, dim=128) with each frontier feature
-# toggled on in isolation, then a "full" run with everything enabled.
-#
+# Small SP1024 config (dim=128, 4L, 500 iters) — exercises new code paths
+# cheaply. SP8192 data prep is expensive (~2hr retokenize), so smokes use
+# SP1024 and the real 8xH100 run uses SP8192.
 # Usage:
 #   bash dev/smoke_frontier.sh            # run all smokes sequentially
-#   bash dev/smoke_frontier.sh qk         # only the QK gain smoke
+#   bash dev/smoke_frontier.sh qk         # one smoke
 #   bash dev/smoke_frontier.sh full       # only the full-stack smoke
-#
-# Components: baseline, qk, pr (parallel residuals), rec (targeted recurrence),
-#             gptq (GPTQ + SDClip + embed), ttt (legal score-first TTT),
-#             wd (Muon weight decay), full
 
 set -e
 cd /workspace/parameter-golf
@@ -21,8 +17,6 @@ fi
 
 pip install -q -r requirements.txt
 
-# Ensure SP1024 data (SP8192 would need local retokenization from docs_selected.jsonl;
-# not feasible on this branch's budget). 4 shards are enough for a smoke.
 DATA_DIR="data/datasets/fineweb10B_sp1024"
 if [ ! -d "$DATA_DIR" ] || [ $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) -lt 1 ]; then
     echo "Downloading SP1024 data (4 shards for smoke)..."
@@ -39,7 +33,7 @@ run_smoke() {
     local name="$1"; shift
     echo ""
     echo "===== SMOKE: $name ====="
-    env $SMOKE_COMMON RUN_ID="smoke_$name" "$@" torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tail -12
+    env $SMOKE_COMMON RUN_ID="smoke_$name" "$@" torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tail -15
     local status=${PIPESTATUS[0]}
     if [ $status -eq 0 ]; then
         echo "$name: PASS"
@@ -53,38 +47,21 @@ COMPONENT="${1:-all}"
 ALL=false
 [ "$COMPONENT" = "all" ] && ALL=true
 
-if $ALL || [ "$COMPONENT" = "baseline" ]; then
-    run_smoke baseline
-fi
-if $ALL || [ "$COMPONENT" = "qk" ]; then
-    run_smoke qk QK_GAIN_INIT=5.25
-fi
-if $ALL || [ "$COMPONENT" = "pr" ]; then
-    run_smoke pr PARALLEL_RESIDUALS=1 QK_GAIN_INIT=5.25
-fi
-if $ALL || [ "$COMPONENT" = "rec" ]; then
-    run_smoke rec TARGETED_RECURRENCE=1 NUM_RECURRENCES=2 RECURRENCE_START_LAYER=1 RECURRENCE_END_LAYER=2 QK_GAIN_INIT=5.25
-fi
-if $ALL || [ "$COMPONENT" = "gptq" ]; then
-    # GPTQ_EMBED=0: embedding-GPTQ has a tied-weight bug.
-    # USE_SDCLIP=0: SDClip's std-based scale doesn't match the amax scale that
-    # QAT trains against — combining them blew up the gap to 2.15 BPB on smoke.
-    run_smoke gptq QUANT_METHOD=gptq GPTQ_EMBED=0 USE_SDCLIP=0 QAT_BITS=6 EXPORT_BITS=6 EMA_DECAY=0.9995 QK_GAIN_INIT=5.25
-fi
-if $ALL || [ "$COMPONENT" = "ttt" ]; then
-    # TTT_MAX_CHUNKS=4 caps smoke to ~4 chunks × a few windows (~seconds).
-    # The full run uses TTT_MAX_CHUNKS=0 (unlimited).
-    run_smoke ttt TTT_ENABLED=1 TTT_CHUNK_TOKENS=1024 TTT_EPOCHS=2 TTT_MAX_CHUNKS=4 EVAL_STRIDE=256 QK_GAIN_INIT=5.25
-fi
-if $ALL || [ "$COMPONENT" = "wd" ]; then
-    run_smoke wd MUON_WEIGHT_DECAY=0.09 QK_GAIN_INIT=5.25
-fi
-if $ALL || [ "$COMPONENT" = "full" ]; then
-    run_smoke full PARALLEL_RESIDUALS=1 TARGETED_RECURRENCE=1 NUM_RECURRENCES=2 RECURRENCE_START_LAYER=1 RECURRENCE_END_LAYER=2 \
-        QUANT_METHOD=gptq GPTQ_EMBED=0 USE_SDCLIP=0 QAT_BITS=6 EXPORT_BITS=6 EMA_DECAY=0.9995 \
-        TTT_ENABLED=1 TTT_CHUNK_TOKENS=1024 TTT_EPOCHS=2 TTT_MAX_CHUNKS=4 EVAL_STRIDE=256 \
-        MUON_WEIGHT_DECAY=0.09 QK_GAIN_INIT=5.25 COMPRESS_METHOD=lzma
-fi
+$ALL || [ "$COMPONENT" = "baseline" ] && run_smoke baseline
+$ALL || [ "$COMPONENT" = "qk" ] && run_smoke qk QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "pr" ] && run_smoke pr PARALLEL_RESIDUALS=1 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "plres" ] && run_smoke plres PARALLEL_LATER_RESIDUALS=1 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "rec" ] && run_smoke rec TARGETED_RECURRENCE=1 NUM_RECURRENCES=2 RECURRENCE_START_LAYER=1 RECURRENCE_END_LAYER=2 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "norm" ] && run_smoke norm LAYERWISE_NORM_SCALE=1 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "muonrow" ] && run_smoke muonrow MUON_ROW_NORM=1 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "prope" ] && run_smoke prope ROPE_FRACTION=0.25 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "gptq" ] && run_smoke gptq QUANT_METHOD=gptq GPTQ_EMBED=0 USE_SDCLIP=1 SDCLIP_K=2.5 EXPORT_BITS=6 EMA_DECAY=0.9965 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "brotli" ] && run_smoke brotli COMPRESS_METHOD=brotli BYTE_SHUFFLE_STRIDE=2 EXPORT_BITS=6 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "ttt" ] && run_smoke ttt TTT_ENABLED=1 TTT_CHUNK_TOKENS=1024 TTT_EPOCHS=2 TTT_MAX_CHUNKS=4 EVAL_STRIDE=256 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "ttt_adapt" ] && run_smoke ttt_adapt TTT_ADAPT_ENABLED=1 TTT_ADAPT_EVERY=8 TTT_ADAPT_START_FRAC=0.1 TTT_ADAPT_LAMBDA=0.1 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "ctrl_reg" ] && run_smoke ctrl_reg CTRL_SURFACE_LAMBDA=0.1 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "wd" ] && run_smoke wd MUON_WEIGHT_DECAY=0.09 QK_GAIN_INIT=5.25
+$ALL || [ "$COMPONENT" = "full" ] && run_smoke full PARALLEL_RESIDUALS=1 PARALLEL_LATER_RESIDUALS=1 TARGETED_RECURRENCE=1 NUM_RECURRENCES=2 RECURRENCE_START_LAYER=1 RECURRENCE_END_LAYER=2 LAYERWISE_NORM_SCALE=1 MUON_ROW_NORM=1 ROPE_FRACTION=0.25 QUANT_METHOD=gptq GPTQ_EMBED=0 USE_SDCLIP=1 SDCLIP_K=2.5 EXPORT_BITS=6 EMA_DECAY=0.9965 TTT_ENABLED=1 TTT_CHUNK_TOKENS=1024 TTT_EPOCHS=2 TTT_MAX_CHUNKS=4 EVAL_STRIDE=256 TTT_ADAPT_ENABLED=1 TTT_ADAPT_EVERY=8 TTT_ADAPT_START_FRAC=0.1 TTT_ADAPT_LAMBDA=0.1 CTRL_SURFACE_LAMBDA=0.1 MUON_WEIGHT_DECAY=0.09 QK_GAIN_INIT=5.25 COMPRESS_METHOD=brotli BYTE_SHUFFLE_STRIDE=2
 
 echo ""
 echo "=== smoke_frontier.sh complete ==="

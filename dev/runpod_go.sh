@@ -11,8 +11,13 @@ set -e
 MODE="${1:-frontier}"
 NGPUS=$(nvidia-smi -L 2>/dev/null | wc -l)
 
-# All modes use SP1024 (the only variant published in the upstream manifest).
-VARIANT=sp1024
+# frontier mode uses SP8192 (trained + retokenized locally via tokenizer_specs.json).
+# smoke + other modes use SP1024 (pre-published in upstream manifest).
+if [ "$MODE" = "frontier" ]; then
+    VARIANT=sp8192
+else
+    VARIANT=sp1024
+fi
 DATA_DIR="data/datasets/fineweb10B_${VARIANT}"
 
 echo "============================================================"
@@ -42,10 +47,14 @@ TRAIN_SHARD_COUNT=$(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l)
 MIN_SHARDS=$([ "$MODE" = "smoke" ] && echo 4 || echo 80)
 if [ "$TRAIN_SHARD_COUNT" -lt "$MIN_SHARDS" ]; then
     echo "Downloading $VARIANT dataset (have $TRAIN_SHARD_COUNT shards, need $MIN_SHARDS)..."
+    # SP8192 requires --also-download-docs to trigger local tokenizer training + retokenization
+    # (manifest only publishes SP1024 pre-tokenized; SP8192 is produced locally from docs_selected.jsonl).
+    EXTRA_ARG=""
+    [ "$VARIANT" = "sp8192" ] && EXTRA_ARG="--also-download-docs"
     if [ "$MODE" = "smoke" ]; then
-        python3 data/cached_challenge_fineweb.py --variant "$VARIANT" --train-shards 4
+        python3 data/cached_challenge_fineweb.py --variant "$VARIANT" --train-shards 4 $EXTRA_ARG
     else
-        python3 data/cached_challenge_fineweb.py --variant "$VARIANT"
+        python3 data/cached_challenge_fineweb.py --variant "$VARIANT" $EXTRA_ARG
     fi
 fi
 echo "Dataset ready: $(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l) train shards ($VARIANT)"
