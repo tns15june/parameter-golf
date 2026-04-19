@@ -1,6 +1,6 @@
 #!/bin/bash
 # Final submission run — 8xH100, competitive config
-# Strategy: 10L/512d, 3x MLP, LeakyReLU², int6 QAT, EMA, sliding window eval
+# Strategy: 10L/512d, 2x MLP, LeakyReLU², int6 QAT, EMA, sliding window eval
 # Usage: bash dev/run_final.sh
 
 set -e
@@ -34,6 +34,10 @@ torchrun --standalone --nproc_per_node=8 train_gpt.py
 
 echo ""
 echo "=== Run complete ==="
-echo "Check logs/submission_v3.txt for full log"
-echo "Copy train.log to records folder:"
-echo "  cp logs/submission_v3.txt records/track_10min_16mb/2026-04_tns15june_v1/train.log"
+LOG_PATH="logs/submission_v4.txt"
+if [ -f "$LOG_PATH" ]; then
+    echo "Filling submission.json + copying train.log from $LOG_PATH..."
+    python3 dev/fill_submission.py "$LOG_PATH"
+else
+    echo "WARN: expected log at $LOG_PATH not found. Run fill_submission.py manually against your log."
+fi

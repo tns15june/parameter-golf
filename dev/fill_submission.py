@@ -42,9 +42,9 @@ def main():
         "github_id": "tns15june",
         "name": "10L/512d LeakyReLU\u00b2 + int6 QAT + EMA + Sliding Window",
         "blurb": (
-            "10-layer dim=512 with 3x MLP and LeakyReLU\u00b2 activation. "
+            "10-layer dim=512 with 2x MLP and LeakyReLU\u00b2 activation. "
             "int6 QAT (start at 15%) + int8 embeddings, LZMA-compressed. "
-            "EMA(0.9995) of weights for export. Sliding-window eval (seq_len=2048, stride=256). "
+            "EMA(0.9995) of weights for export. Sliding-window eval (seq_len=1024, stride=256). "
             f"Post-quant roundtrip BPB: {val_bpb:.4f}."
         ),
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
