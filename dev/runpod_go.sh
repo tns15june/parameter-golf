@@ -18,6 +18,16 @@ echo "============================================================"
 # Setup
 export HF_HOME=/workspace/.cache/huggingface
 cd /workspace/parameter-golf
+
+# Optional: load HF_TOKEN from huggingface_token.txt if present (gitignored).
+# Useful to avoid rate-limits on dataset downloads. Never logs the token.
+if [ -z "${HF_TOKEN:-}" ] && [ -f huggingface_token.txt ]; then
+    export HF_TOKEN="$(tr -d '[:space:]' < huggingface_token.txt)"
+    if [ -n "$HF_TOKEN" ]; then
+        echo "HF_TOKEN loaded from huggingface_token.txt ($(echo -n "$HF_TOKEN" | wc -c) chars)"
+    fi
+fi
+
 pip install -q -r requirements.txt
 
 # Download dataset if needed
