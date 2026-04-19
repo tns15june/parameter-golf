@@ -79,6 +79,8 @@ class Hyperparameters:
     # Depth recurrence: share weights across layers for wider models.
     num_unique_layers = int(os.environ.get("NUM_UNIQUE_LAYERS", os.environ.get("NUM_LAYERS", "9")))
     num_recurrences = int(os.environ.get("NUM_RECURRENCES", "1"))
+    # Parallel residuals: attn and MLP both read the pre-residual state (frontier delta ~0.01 BPB).
+    parallel_residuals = bool(int(os.environ.get("PARALLEL_RESIDUALS", "0")))
 
     # Quantization-aware training (0=disabled, 4 or 8).
     qat_bits = int(os.environ.get("QAT_BITS", "0"))
@@ -813,21 +815,27 @@ class Block(nn.Module):
         num_kv_heads: int,
         mlp_mult: int,
         rope_base: float,
+        parallel_residuals: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base)
         self.mlp = MLP(dim, mlp_mult)
+        self.parallel_residuals = parallel_residuals
 
     def forward(self, x: Tensor, x0: Tensor,
                 attn_scale: Tensor, mlp_scale: Tensor,
                 resid_mix: Tensor, q_gain: Tensor) -> Tensor:
         mix = resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x), q_gain)
-        x = x + attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        attn_s = attn_scale.to(dtype=x.dtype)[None, None, :]
+        mlp_s = mlp_scale.to(dtype=x.dtype)[None, None, :]
+        if self.parallel_residuals:
+            # Attn + MLP both read the same pre-residual x, outputs merged afterwards.
+            return x + attn_s * self.attn(self.attn_norm(x), q_gain) + mlp_s * self.mlp(self.mlp_norm(x))
+        x = x + attn_s * self.attn(self.attn_norm(x), q_gain)
+        x = x + mlp_s * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -846,6 +854,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        parallel_residuals: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -866,7 +875,7 @@ class GPT(nn.Module):
 
         # Shared transformer blocks (only num_unique_layers instantiated)
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, parallel_residuals)
             for _ in range(num_unique_layers)
         ])
 
@@ -1039,6 +1048,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        parallel_residuals=args.parallel_residuals,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
