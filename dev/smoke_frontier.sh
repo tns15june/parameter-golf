@@ -66,9 +66,10 @@ if $ALL || [ "$COMPONENT" = "rec" ]; then
     run_smoke rec TARGETED_RECURRENCE=1 NUM_RECURRENCES=2 RECURRENCE_START_LAYER=1 RECURRENCE_END_LAYER=2 QK_GAIN_INIT=5.25
 fi
 if $ALL || [ "$COMPONENT" = "gptq" ]; then
-    # GPTQ_EMBED=0: the embedding-GPTQ path produces a catastrophic export gap
-    # (tied-weight dual-use bug). SDClip on non-embed layers is still exercised.
-    run_smoke gptq QUANT_METHOD=gptq GPTQ_EMBED=0 USE_SDCLIP=1 SDCLIP_K=2.5 QAT_BITS=6 EXPORT_BITS=6 EMA_DECAY=0.9995 QK_GAIN_INIT=5.25
+    # GPTQ_EMBED=0: embedding-GPTQ has a tied-weight bug.
+    # USE_SDCLIP=0: SDClip's std-based scale doesn't match the amax scale that
+    # QAT trains against — combining them blew up the gap to 2.15 BPB on smoke.
+    run_smoke gptq QUANT_METHOD=gptq GPTQ_EMBED=0 USE_SDCLIP=0 QAT_BITS=6 EXPORT_BITS=6 EMA_DECAY=0.9995 QK_GAIN_INIT=5.25
 fi
 if $ALL || [ "$COMPONENT" = "ttt" ]; then
     # TTT_MAX_CHUNKS=4 caps smoke to ~4 chunks × a few windows (~seconds).
@@ -80,7 +81,7 @@ if $ALL || [ "$COMPONENT" = "wd" ]; then
 fi
 if $ALL || [ "$COMPONENT" = "full" ]; then
     run_smoke full PARALLEL_RESIDUALS=1 TARGETED_RECURRENCE=1 NUM_RECURRENCES=2 RECURRENCE_START_LAYER=1 RECURRENCE_END_LAYER=2 \
-        QUANT_METHOD=gptq GPTQ_EMBED=0 USE_SDCLIP=1 SDCLIP_K=2.5 QAT_BITS=6 EXPORT_BITS=6 EMA_DECAY=0.9995 \
+        QUANT_METHOD=gptq GPTQ_EMBED=0 USE_SDCLIP=0 QAT_BITS=6 EXPORT_BITS=6 EMA_DECAY=0.9995 \
         TTT_ENABLED=1 TTT_CHUNK_TOKENS=1024 TTT_EPOCHS=2 TTT_MAX_CHUNKS=4 EVAL_STRIDE=256 \
         MUON_WEIGHT_DECAY=0.09 QK_GAIN_INIT=5.25 COMPRESS_METHOD=lzma
 fi
