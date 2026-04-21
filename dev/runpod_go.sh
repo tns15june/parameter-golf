@@ -3,10 +3,10 @@
 # Usage: bash dev/runpod_go.sh [MODE]
 #   frontier     — 8xH100 SP8192 frontier-port submission (the competition run).
 #                  Requires SP8192 data on the volume; runs prep first if missing.
-#   prep-sp8192  — 1xH100 data prep ONLY: train SP8192 BPE + retokenize docs,
-#                  then exit. Use this on a cheap 1xH100 pod before spinning up
-#                  the 8xH100 — frontier mode itself would happily launch
-#                  torchrun --nproc_per_node=8 and fail on a 1-GPU pod.
+#   prep-sp8192  — DEPRECATED since 2026-04-21: SP8192 is now pulled pre-tokenized
+#                  from kevclark/parameter-golf on HF during normal `frontier` mode
+#                  (~10 min, ~$1-2). Use this mode only if you explicitly need to
+#                  retokenize locally (SP8192_FORCE_LOCAL_TOKENIZE=1, ~$7, 2-3 hr).
 #   smoke [case] — 1xH100 per-component smoke tests (calls dev/smoke_frontier.sh).
 #                  case=sp8192 exercises the SP8192 code path (requires Phase A
 #                  data to exist on the volume). Other cases use SP1024.
@@ -55,20 +55,31 @@ if [ "$MODE" = "smoke" ] && [ "${2:-all}" = "sp8192" ]; then
 fi
 
 # Download dataset if needed (variant chosen by mode above).
+# 2026-04-21: SP8192 is now available PRE-TOKENIZED from kevclark/parameter-golf
+# on HuggingFace (same mirror bigbag uses for 1.0810 reproduction). This is ~15x
+# cheaper than local retokenize (~$1 download vs ~$7 on 1xH100 for 2-3 hr).
 TRAIN_SHARD_COUNT=$(ls "$DATA_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l)
 MIN_SHARDS=$([ "$MODE" = "smoke" ] && echo 4 || echo 80)
 if [ "${SKIP_DATA_SETUP:-0}" = "0" ] && [ "$TRAIN_SHARD_COUNT" -lt "$MIN_SHARDS" ]; then
     if [ "$VARIANT" = "sp8192" ]; then
-        # SP8192 is NOT published pre-tokenized. Produce it locally. Use the
-        # SP8192-only tokenizer config so we don't also rebuild SP1024 (which
-        # would (a) double the work and (b) hit the unlink-before-reuse bug
-        # in build_sentencepiece_tokenizer that deletes the source file before
-        # copying it).
-        echo "Generating SP8192 data locally via download_hf_docs_and_tokenize.py..."
-        python3 data/download_hf_docs_and_tokenize.py \
-            --output-root data \
-            --tokenizer-config data/tokenizer_specs_sp8192.json \
-            --skip-byte
+        # Prefer the pre-tokenized HF mirror. Fall back to local retokenize only if
+        # SP8192_FORCE_LOCAL_TOKENIZE=1 is set (e.g. to reproduce the legacy path).
+        if [ "${SP8192_FORCE_LOCAL_TOKENIZE:-0}" = "1" ]; then
+            echo "Generating SP8192 data locally via download_hf_docs_and_tokenize.py (forced)..."
+            python3 data/download_hf_docs_and_tokenize.py \
+                --output-root data \
+                --tokenizer-config data/tokenizer_specs_sp8192.json \
+                --skip-byte
+        else
+            echo "Downloading pre-tokenized SP8192 from kevclark/parameter-golf on HF..."
+            if [ "$MODE" = "smoke" ]; then
+                MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
+                    python3 data/cached_challenge_fineweb.py --variant sp8192 --train-shards 4
+            else
+                MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
+                    python3 data/cached_challenge_fineweb.py --variant sp8192
+            fi
+        fi
     else
         echo "Downloading $VARIANT dataset (have $TRAIN_SHARD_COUNT shards, need $MIN_SHARDS)..."
         if [ "$MODE" = "smoke" ]; then

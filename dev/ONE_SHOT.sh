@@ -142,19 +142,27 @@ if [ "$SP1024_SHARDS" -lt 80 ]; then
 fi
 [ "$SP1024_SHARDS" -ge 80 ] || fail "SP1024 shards still short ($SP1024_SHARDS)"
 
-# SP8192 data for Phase 2 (presence check only — do NOT generate on 8xH100)
+# SP8192 data for Phase 2. Since 2026-04-21 we pull pre-tokenized SP8192 from
+# kevclark/parameter-golf on HF (~10 min, ~$1-2 of 8xH100 time). If shards are
+# missing we download them here BEFORE starting paid training.
 SP8192_SHARDS=$(ls "$SP8192_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l)
 SP8192_MODEL="$REPO/data/tokenizers/fineweb_8192_bpe.model"
 echo "SP8192 train shards: $SP8192_SHARDS  (model exists: $([ -f "$SP8192_MODEL" ] && echo yes || echo NO))"
 
 RUN_PHASE2=0
 if [ "$MODE" != "safe" ]; then
+    if [ "$SP8192_SHARDS" -lt 80 ] || [ ! -f "$SP8192_MODEL" ]; then
+        echo "  SP8192 incomplete — downloading pre-tokenized data from kevclark/parameter-golf (~10 min)..."
+        MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
+            python3 data/cached_challenge_fineweb.py --variant sp8192 \
+            || { echo "  WARN: SP8192 HF download failed. Phase 2 will SKIP."; RUN_PHASE2=0; }
+        SP8192_SHARDS=$(ls "$SP8192_DIR"/fineweb_train_*.bin 2>/dev/null | wc -l)
+    fi
     if [ "$SP8192_SHARDS" -ge 80 ] && [ -f "$SP8192_MODEL" ]; then
         RUN_PHASE2=1
+        echo "  SP8192 ready: $SP8192_SHARDS train shards + tokenizer. Phase 2 enabled."
     else
-        echo "  SP8192 data NOT ready. Phase 2 will be SKIPPED."
-        echo "  To enable, run this ONCE on a cheap 1xH100 pod first:"
-        echo "      bash dev/runpod_go.sh prep-sp8192   # ~2–3 hr, ~\$7"
+        echo "  SP8192 still not ready ($SP8192_SHARDS shards). Phase 2 will SKIP."
         RUN_PHASE2=0
     fi
 fi

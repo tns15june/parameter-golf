@@ -1,13 +1,25 @@
 #!/bin/bash
-# Full SP8192 frontier submission run (8xH100).
-# Components: SP8192 data/tokenizer, 11L x 512d x MLP4x, targeted recurrence,
-# parallel residuals (same-block + from-later-layers via softmax mix), partial
-# RoPE 25%, layerwise RMSNorm scale, QK gain 5.25, MuonEq-R + WD 0.09, EMA
-# 0.9965, GPTQ + SDClip (no QAT), int8 embeddings, byte-shuffle + Brotli
-# packing, legal score-first sliding TTT, first-order TTT-adaptable training,
-# control-surface regularizer.
+# Full SP8192 frontier submission run (8xH100) — aligned to bigbag 1.0810 SOTA.
+#
+# 2026-04-21 re-tuning: after code review vs the upstream PR #1493 record,
+# these env defaults were changed to match bigbag's validated config where our
+# code allows:
+#   - Recurrence layers 3..5 x 3 (17 effective layers) instead of 4..7 x 3
+#     (19 effective). Exactly matches bigbag's [0,1,2,3,4,5,3,4,5,3,4,5,6,7,8,9,10].
+#   - SDCLIP_K 12.85 (was 2.5). k=2.5 hard-clips int6 weights at ~2.5σ and
+#     dominates the export gap.
+#   - TTT_LR 5e-3 (was 1e-5), TTT_EPOCHS 3 (was 2), TTT_CHUNK_TOKENS 32768 (was 8192).
+#     bigbag's aggressive TTT contributes ~0.02 BPB over conservative TTT.
+#   - MUON_WEIGHT_DECAY 0.095 (was 0.090).
+#
+# What we still CAN'T match without editing train_gpt.py:
+#   - Progressive recurrence activation (bigbag switches in at step ~2016).
+#   - flash_attn_3 (bigbag uses a custom wheel; we use F.SDPA).
+#   - Cosine-decay TTT LR across chunks.
 #
 # Usage: bash dev/run_frontier.sh
+# Override any env var on the command line to experiment, e.g.
+#   SDCLIP_K=2.5 TTT_LR=1e-5 bash dev/run_frontier.sh    # revert to pre-retune defaults
 
 set -e
 cd /workspace/parameter-golf
@@ -18,8 +30,8 @@ VOCAB_SIZE="${VOCAB_SIZE:-8192}" \
 NUM_UNIQUE_LAYERS="${NUM_UNIQUE_LAYERS:-11}" \
 NUM_RECURRENCES="${NUM_RECURRENCES:-3}" \
 TARGETED_RECURRENCE="${TARGETED_RECURRENCE:-1}" \
-RECURRENCE_START_LAYER="${RECURRENCE_START_LAYER:-4}" \
-RECURRENCE_END_LAYER="${RECURRENCE_END_LAYER:-7}" \
+RECURRENCE_START_LAYER="${RECURRENCE_START_LAYER:-3}" \
+RECURRENCE_END_LAYER="${RECURRENCE_END_LAYER:-5}" \
 MODEL_DIM="${MODEL_DIM:-512}" \
 NUM_HEADS="${NUM_HEADS:-8}" \
 NUM_KV_HEADS="${NUM_KV_HEADS:-4}" \
@@ -33,21 +45,21 @@ PARALLEL_RESIDUALS="${PARALLEL_RESIDUALS:-1}" \
 PARALLEL_LATER_RESIDUALS="${PARALLEL_LATER_RESIDUALS:-1}" \
 LAYERWISE_NORM_SCALE="${LAYERWISE_NORM_SCALE:-1}" \
 LOGIT_SOFTCAP="${LOGIT_SOFTCAP:-30.0}" \
-MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-0.09}" \
+MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-0.095}" \
 MUON_ROW_NORM="${MUON_ROW_NORM:-1}" \
 EXPORT_BITS="${EXPORT_BITS:-6}" \
 EMBED_EXPORT_BITS="${EMBED_EXPORT_BITS:-8}" \
 QUANT_METHOD="${QUANT_METHOD:-gptq}" \
 GPTQ_EMBED="${GPTQ_EMBED:-0}" \
 USE_SDCLIP="${USE_SDCLIP:-1}" \
-SDCLIP_K="${SDCLIP_K:-2.5}" \
+SDCLIP_K="${SDCLIP_K:-12.85}" \
 EMA_DECAY="${EMA_DECAY:-0.9965}" \
 EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-1024}" \
 EVAL_STRIDE="${EVAL_STRIDE:-256}" \
 TTT_ENABLED="${TTT_ENABLED:-1}" \
-TTT_LR="${TTT_LR:-1e-5}" \
-TTT_CHUNK_TOKENS="${TTT_CHUNK_TOKENS:-8192}" \
-TTT_EPOCHS="${TTT_EPOCHS:-2}" \
+TTT_LR="${TTT_LR:-5e-3}" \
+TTT_CHUNK_TOKENS="${TTT_CHUNK_TOKENS:-32768}" \
+TTT_EPOCHS="${TTT_EPOCHS:-3}" \
 TTT_MAX_CHUNKS="${TTT_MAX_CHUNKS:-0}" \
 TTT_ADAPT_ENABLED="${TTT_ADAPT_ENABLED:-0}" \
 TTT_ADAPT_EVERY="${TTT_ADAPT_EVERY:-32}" \

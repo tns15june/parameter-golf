@@ -88,7 +88,7 @@ SP8192_VAL=$(ls "$SP8192_DIR"/fineweb_val_*.bin 2>/dev/null | wc -l)
 if [ "$SP8192_N" -ge 80 ] && [ "$SP8192_VAL" -ge 1 ] && [ -f "$SP8192_MODEL" ]; then
     ok "SP8192: $SP8192_N train + $SP8192_VAL val shard + tokenizer (Phase 2 READY)"
 else
-    warn "SP8192: $SP8192_N train, $SP8192_VAL val, model=$([ -f "$SP8192_MODEL" ] && echo yes || echo NO) — Phase 2 will SKIP unless prepped on a cheap 1xH100 first (~\$7, 2–3 hr)"
+    warn "SP8192: $SP8192_N train, $SP8192_VAL val, model=$([ -f "$SP8192_MODEL" ] && echo yes || echo NO) — ONE_SHOT will auto-pull from kevclark/parameter-golf (~10 min, ~\$1–2)"
 fi
 
 # ---- 6. Disk ---------------------------------------------------------------
