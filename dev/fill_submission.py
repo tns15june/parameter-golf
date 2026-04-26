@@ -48,11 +48,14 @@ def main():
         name = f"SP8192 Frontier: 11L/4xMLP + TargetedRec + ParallelLaterRes + PartialRoPE + LyrNorm + MuonEq-R + GPTQ+SDClip + Brotli + LegalTTT{ttt_name}"
         blurb = (
             "11-layer dim=512 x MLP4x on SP8192. Targeted middle recurrence "
-            "(layers 4..7 x 3, 19 effective). Parallel residuals from later layers "
-            "(softmax mix). Partial RoPE 25%. Layerwise RMSNorm scale. QK gain 5.25. "
-            "MuonEq-R (row-normalized Muon) + WD 0.09. EMA 0.9965. int6 GPTQ with "
-            "SDClip (k=2.5), int8 amax embeddings. Byte-shuffle + Brotli-11 compression. "
-            f"Legal score-first sliding TTT{ttt_blurb}. "
+            "(layers 3..5 x 3, 17 effective). Parallel residuals from later layers "
+            "(softmax mix). Partial RoPE 25%. LeakyReLU(0.5)^2 MLP. "
+            "Layerwise RMSNorm scale. QK gain 5.25. MuonEq-R (row-normalized Muon) "
+            "+ WD 0.095, matrix LR 0.022, wallclock warmdown frac 0.72. EMA 0.9965. "
+            "int6 GPTQ with SDClip (k=12.85), int8 amax embeddings. "
+            "Byte-shuffle + Brotli-11 compression. Legal score-first sliding TTT "
+            "(lr=0.005, 3 epochs, 32K chunks)"
+            f"{ttt_blurb}. "
             f"Post-quant roundtrip BPB: {val_bpb:.4f}."
         )
     elif is_sp1024_frontier:

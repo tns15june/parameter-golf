@@ -1,104 +1,98 @@
-## SP8192 Frontier: Full Port
+## SP8192 Frontier: Final Submission
 
 ### Approach
 
-SP8192-tokenized FineWeb with the full frontier component set. Nine interlocking
-pieces, not a grab-bag of grafts:
+SP8192-tokenized FineWeb with the frontier component set that this branch can
+support without external kernels:
 
-1. **SP8192 tokenizer + data**: locally trained SentencePiece BPE 8192 over
-   `docs_selected.jsonl`; 196 retokenized shards (195 train + 1 val).
-2. **11 layers × 512 dim × MLP 4x**: deeper, wider MLP than the SP1024 scaffold.
-3. **Partial RoPE (25%)**: first 25% of each head's dims rotate; 75% pass through.
-4. **Layerwise RMSNorm scale**: per-(effective-)layer learnable scalars on both
-   attention and MLP norms.
-5. **Targeted middle-layer recurrence**: layers 4..7 looped 3× inside an
-   11-layer physical backbone (19 effective layers). Per-effective-layer
-   control scalars unshared.
-6. **Parallel residuals from later layers**: softmax-weighted mix of all encoder
-   outputs into each decoder layer via learned `late_mix` matrix.
-7. **Optimizer**: Muon with row-normalization (MuonEq-R) + weight decay 0.09;
-   Adam for embeddings/heads/scalars. EMA decay 0.9965 for export weights.
-8. **Export**: pure GPTQ (Hessian-aware column rounding) on non-embed 2D weights
-   with SDClip per-row scale (k=2.5). int8 amax embeddings. Byte-shuffle +
-   Brotli quality-11 compression.
-9. **Eval**: legal score-first sliding TTT (`TTT_ENABLED=1`) with scope-once-
-   per-token accumulation matching `eval_val_sliding`'s protocol.
+1. **SP8192 tokenizer + data**: pre-tokenized mirror from
+   `kevclark/parameter-golf` via `data/cached_challenge_fineweb.py`.
+2. **11 layers x 512 dim x MLP 4x**: tied embeddings, QK gain 5.25,
+   LeakyReLU(0.5)^2 MLP for the final frontier run.
+3. **Partial RoPE (25%)**: first 16 of 64 head dims rotate.
+4. **Layerwise RMSNorm scale**: learnable norm scales in each block.
+5. **Targeted middle-layer recurrence**: layers 3..5 looped 3x in an
+   11-layer physical backbone (17 effective visits).
+6. **Parallel residuals**: attention and MLP share the pre-residual state, plus
+   a learned softmax mix from encoder outputs into decoder layers.
+7. **Optimizer**: MuonEq-R with row normalization, WD 0.095, matrix LR 0.022,
+   scalar LR 0.02, tied embedding LR 0.03, grad clipping 0.3, EMA 0.9965, and
+   wallclock-fraction warmdown 0.72.
+8. **Export**: int6 GPTQ on non-embedding matrices with SDClip k=12.85, int8
+   amax embeddings, byte-shuffle, and Brotli quality 11 compression.
+9. **Eval**: score-first sliding TTT with lr 0.005, 3 epochs, 32K-token chunks,
+   and stride 256. Tokens are scored before any update on the same chunk.
 
 ### Configuration
 
-See `dev/run_frontier.sh` for the complete env-var set. Key defaults:
+The final launcher is `dev/run_frontier.sh`. Key defaults:
 
-```
-VOCAB_SIZE=8192 DATA_PATH=data/datasets/fineweb10B_sp8192
+```bash
+DATA_PATH=data/datasets/fineweb10B_sp8192
+TOKENIZER_PATH=data/tokenizers/fineweb_8192_bpe.model
+VOCAB_SIZE=8192
 NUM_UNIQUE_LAYERS=11 NUM_RECURRENCES=3 TARGETED_RECURRENCE=1
-RECURRENCE_START_LAYER=4 RECURRENCE_END_LAYER=7
+RECURRENCE_START_LAYER=3 RECURRENCE_END_LAYER=5
 MODEL_DIM=512 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_MULT=4
-TRAIN_SEQ_LEN=1024 TIE_EMBEDDINGS=1
+MLP_NEGATIVE_SLOPE=0.5 TRAIN_SEQ_LEN=1024 TIE_EMBEDDINGS=1
 QK_GAIN_INIT=5.25 ROPE_FRACTION=0.25
 PARALLEL_RESIDUALS=1 PARALLEL_LATER_RESIDUALS=1 LAYERWISE_NORM_SCALE=1
-MUON_WEIGHT_DECAY=0.09 MUON_ROW_NORM=1
-EXPORT_BITS=6 EMBED_EXPORT_BITS=8 QUANT_METHOD=gptq USE_SDCLIP=1 SDCLIP_K=2.5
-EMA_DECAY=0.9965 EVAL_STRIDE=256 TTT_ENABLED=1 TTT_CHUNK_TOKENS=8192 TTT_EPOCHS=2
+MATRIX_LR=0.022 SCALAR_LR=0.02 TIED_EMBED_LR=0.03
+MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92
+MUON_MOMENTUM_WARMUP_STEPS=1500 MUON_WEIGHT_DECAY=0.095 MUON_ROW_NORM=1
+GRAD_CLIP_NORM=0.3 WARMDOWN_FRAC=0.72 EMA_DECAY=0.9965
+EXPORT_BITS=6 EMBED_EXPORT_BITS=8 QUANT_METHOD=gptq GPTQ_EMBED=0
+USE_SDCLIP=1 SDCLIP_K=12.85
+EVAL_STRIDE=256 TTT_ENABLED=1 TTT_LR=5e-3
+TTT_CHUNK_TOKENS=32768 TTT_EPOCHS=3
 COMPRESS_METHOD=brotli BYTE_SHUFFLE_STRIDE=2
 TRAIN_BATCH_TOKENS=524288 MAX_WALLCLOCK_SECONDS=600
 ```
 
-### Data Prep (one-time on 1×H100, ~2–3 hrs, ~$7)
-
-SP8192 is **not** published pre-tokenized by the upstream manifest. Produce it
-locally with the SP8192-only tokenizer config (using the combined config also
-instantiates `sp_bpe_1024` which double-processes the corpus AND hits a
-unlink-before-reuse bug in `build_sentencepiece_tokenizer` when
-`--reuse-sp-model 1024=...` points at the SP1024 target of that same spec):
+### Data Prep
 
 ```bash
-python3 data/download_hf_docs_and_tokenize.py \
-    --output-root data \
-    --tokenizer-config data/tokenizer_specs_sp8192.json \
-    --skip-byte
+MATCHED_FINEWEB_REPO_ID=kevclark/parameter-golf \
+python3 data/cached_challenge_fineweb.py --variant sp8192
 ```
 
-Or via the launcher, which wraps exactly this call:
+Or use the launcher, which downloads the mirror automatically if enough shards
+are not already present:
 
 ```bash
-bash dev/runpod_go.sh prep-sp8192
+bash dev/runpod_go.sh frontier
 ```
 
 ### Run
 
 ```bash
-bash dev/runpod_go.sh frontier 2>&1 | tee logs/submission_frontier.txt
+bash dev/runpod_go.sh frontier 2>&1 | tee logs/submission_frontier.console.txt
 ```
 
-The run script auto-invokes `dev/fill_submission.py` to populate
-`submission.json` with real metrics + frontier blurb.
+The launcher runs `dev/fill_submission.py` after training to populate
+`submission.json` and copy the full log to `train.log`.
 
 ### Key Metrics
 
-*(Filled post-run. 2-seed mean: seed 1337 + SEED=42.)*
+Filled post-run by `dev/fill_submission.py`.
 
 - Pre-quant eval: `val_loss:___ val_bpb:___`
 - Post-quant roundtrip: `val_loss:___ val_bpb:___`
 - Export gap: `___`
 - Train time: `___ ms`
 - Eval time: `___ ms`
-- Serialized model (int6 + Brotli + byte-shuffle): `___ bytes`
+- Serialized model: `___ bytes`
 - Code size: `___ bytes`
 - Total submission size: `___ bytes`
 
 ### Included Files
 
-- `train_gpt.py` — byte-identical copy of root (enforced by `dev/sync_submission.sh`)
-- `train.log` — full log from the 8×H100 run
-- `submission.json` — auto-filled metrics + matching SP8192 blurb
+- `train_gpt.py`: self-contained compressed wrapper for the final training code
+- `train.log`: full 8-GPU run log, filled after the final run
+- `submission.json`: final metrics, filled after the final run
 
-### Deferred (known gaps vs current frontier record)
+### Known Gaps
 
-- Global-causal-order legal TTT (current impl is rank-partitioned; scope-once
-  fix landed but cross-rank adaptation stream does not propagate)
-- GPTQ on tied embeddings (requires fixed combined Hessian for the dual-use
-  weight; our post-hook captures only the F.linear path and corrupted the
-  embedding lookup in SP1024 smoke — currently `GPTQ_EMBED=0`)
-- TTT-adaptable training (`TTT_ADAPT_ENABLED=0` by default — uncompiled backward
-  requires the manual gradient all-reduce shipped in this branch but not yet
-  empirically validated at 8×H100)
+- No flash-attn-3 dependency; this branch uses PyTorch SDPA for portability.
+- Progressive recurrence activation from the upstream record is not implemented.
+- TTT is score-first and causal, but adaptation is rank-partitioned under DDP.
